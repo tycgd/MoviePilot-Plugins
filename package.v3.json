@@ -1,0 +1,16 @@
+{
+  "SiQiCleanBeachV3": {
+    "name": "思齐自动收垃圾",
+    "description": "自动在思齐站点清理沙滩并收集垃圾，支持Cron和间隔定时。",
+    "labels": "站点,工具",
+    "version": "1.1.0",
+    "icon": "Moviepilot_A.png",
+    "author": "bfjy",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.1.0": "新增自动搬砖：每日自动搬满 50 块，支持单次上限与手动触发。",
+      "v1.0.0": "首次发布：基于 SiQiCleanBeach 移植到 MoviePilot V3 SDK。"
+    }
+  }
+}
