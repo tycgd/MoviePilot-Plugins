@@ -95,6 +95,41 @@ def _today(module) -> str:
     return datetime.now(_timezone(module)).strftime("%Y-%m-%d")
 
 
+def make_config(**overrides) -> dict:
+    """构造一份完整的插件配置快照，用于校验 set_option 的整体回写。"""
+    config = {
+        "enabled": True,
+        "notify": False,
+        "cookie": "c_secure_pass=token",
+        "schedule_mode": "interval",
+        "cron": "7 */2 * * *",
+        "interval_minutes": 61,
+        "max_casts_per_run": 6,
+        "daily_cast_limit": 40,
+        "cast_interval": 0,
+        "dry_run": False,
+        "lure_mode": "auto",
+        "lure_key": "normal",
+        "rod_mode": "auto",
+        "rod_key": "mushroom",
+        "auto_buy": False,
+        "buy_lure_key": "normal",
+        "buy_budget_per_day": 0,
+        "keep_lures": 20,
+        "slider_mode": "perfect",
+        "slider_center": 0.5,
+        "slider_jitter": 0.03,
+        "auto_task": False,
+        "auto_guess": False,
+        "guess_value": 0,
+        "slot_spread": False,
+        "per_slot_casts": 8,
+        "run_once": False,
+    }
+    config.update(overrides)
+    return config
+
+
 def build_plugin(module):
     """绕过 _PluginBase.__init__ 构造最小实例。"""
     plugin = object.__new__(module.SiQiFishingV3)
@@ -167,9 +202,17 @@ def build_plugin(module):
         "last_message": "",
     }
     plugin._data = {}
+    plugin._config_snapshot = make_config()
+    plugin._updated_configs = []
     plugin.save_data = lambda key, value: plugin._data.__setitem__(key, value)
     plugin.get_data = lambda key, default=None: plugin._data.get(key, default)
-    plugin.update_config = lambda config: None
+    plugin.get_config = lambda: plugin._config_snapshot
+
+    def _update_config(config):
+        plugin._updated_configs.append(config)
+        plugin._config_snapshot = dict(config)
+
+    plugin.update_config = _update_config
     plugin.post_message = lambda **kwargs: None
     return plugin
 
@@ -301,7 +344,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.0.0"
+    assert cls.plugin_version == "1.1.0"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -373,7 +416,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.0.0"
+    assert cls.plugin_version == "1.1.0"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1115,6 +1158,557 @@ def test_notification_status_text():
     sent.clear()
     notify(plugin, {"status": "auth_failed", "message": "no cookie", "data": {}})
     assert "🔐 认证失败" in sent.get("text", "")
+
+
+class StubScheduler:
+    """记录一次性任务注册与移除，避免触碰真实调度器。"""
+
+    def __init__(self) -> None:
+        self.added: list = []
+        self.removed: list = []
+
+    def add_plugin_once_job(self, *args, **kwargs):
+        self.added.append((args, kwargs))
+        return True
+
+    def remove_plugin_once_job(self, *args, **kwargs):
+        self.removed.append((args, kwargs))
+        return True
+
+
+def _stub_runtime(monkeypatch, module, *, data=None, responses=None) -> StubScheduler:
+    """替换网络、站点与调度器，并预置页面 HTML 与 action 响应。"""
+    scheduler = StubScheduler()
+    monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    monkeypatch.setattr(module, "scheduler_sdk", scheduler)
+    ActionRequestUtils.reset(
+        responses=responses or {},
+        html=fishing_html(data if data is not None else make_data()),
+    )
+    return scheduler
+
+
+def _lock_plugin(plugin):
+    """给插件装上已持有的运行锁，模拟任务执行中。"""
+    lock = asyncio.Lock()
+    asyncio.run(lock.acquire())
+    plugin._lock = lock
+    return lock
+
+
+def _iter_nodes(node):
+    """深度优先遍历页面 JSON 中的全部字典节点。"""
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _iter_nodes(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _iter_nodes(item)
+
+
+def _page_button_events(page):
+    """产出页面中所有携带 events 的节点及其事件处理器。"""
+    for node in _iter_nodes(page):
+        events = node.get("events")
+        if not isinstance(events, dict):
+            continue
+        for handler in events.values():
+            if isinstance(handler, dict):
+                yield node, handler
+
+
+def _option_buttons(page, key: str, value=None):
+    """找出点击参数引用了指定配置键（可选指定取值）的按钮节点。"""
+    found: list = []
+    seen: set = set()
+    for node, handler in _page_button_events(page):
+        params = handler.get("params")
+        if not isinstance(params, dict):
+            continue
+        text = json.dumps(params, ensure_ascii=False)
+        if key not in text:
+            continue
+        if value is not None and str(value) not in text:
+            continue
+        if id(node) not in seen:
+            seen.add(id(node))
+            found.append(node)
+    return found
+
+
+def _rich_page(plugin, **state) -> list:
+    """填充一组足以渲染全部卡片的运行态，再返回详情页结构。"""
+    plugin._state.update(
+        {
+            "attempts_used": 5,
+            "attempts_limit": 50,
+            "catches": 2,
+            "magic": 1200,
+            "lures": {"normal": 12, "insect": 3, "camouflage": 0},
+            "rods": {"mushroom": {"unlocked": True}, "star": {"unlocked": True}},
+            "selected_lure": "normal",
+            "selected_rod": "mushroom",
+            "codex_total": 10,
+            "codex_unlocked": 3,
+            "tasks": {"1": {"progress": {"ready": True}}},
+            "tasks_ready": 1,
+        }
+    )
+    plugin._state.update(state)
+    plugin._daily["history"] = [
+        {"time": "12:00:00", "action": "catch", "detail": "鲫鱼（普通/完美）"}
+    ]
+    return plugin.get_page()
+
+
+def test_page_button_api_prefix():
+    """详情页所有按钮事件都指向本插件的 API，且不得携带明文 apikey。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    page = _rich_page(plugin)
+
+    apis = [
+        handler["api"]
+        for _, handler in _page_button_events(page)
+        if isinstance(handler.get("api"), str)
+    ]
+
+    assert apis, "详情页必须提供可点击的操作按钮"
+    for api in apis:
+        assert api, "按钮 API 不能为空"
+        assert api.startswith("plugin/SiQiFishingV3/"), api
+        assert "apikey=" not in api, api
+
+
+def test_page_button_events_structure():
+    """按钮事件的 api/method/params 三个字段必须齐备且类型正确。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    page = _rich_page(plugin)
+
+    handlers = list(_page_button_events(page))
+
+    assert len(handlers) >= 4, "快捷操作与策略调节卡片至少提供 4 个按钮"
+    for _, handler in handlers:
+        assert isinstance(handler.get("api"), str) and handler["api"]
+        assert handler.get("method") in ("get", "post"), handler
+        assert isinstance(handler.get("params"), dict), handler
+
+
+def test_get_api_new_endpoints():
+    """四个新接口均以 POST + bear 暴露，/run 保持可用。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+
+    apis = {api["path"]: api for api in plugin.get_api()}
+
+    for path in ("/fish_now", "/sync", "/set_option", "/deliver"):
+        assert path in apis, sorted(apis)
+        assert apis[path]["methods"] == ["POST"], path
+        assert apis[path]["auth"] == "bear", path
+        assert callable(apis[path]["endpoint"]), path
+
+    assert "/run" in apis
+    assert apis["/run"]["methods"] == ["POST"]
+
+
+def test_set_option_rejects_unknown_key():
+    """配置页专属键与未知键必须拒绝，并提示去配置页修改。"""
+    module = load_plugin_module()
+    normalize = getattr(module.SiQiFishingV3, "_SiQiFishingV3__normalize_option")
+
+    for key in (
+        "cookie",
+        "cron",
+        "schedule_mode",
+        "interval_minutes",
+        "enabled",
+        "notify",
+        "run_once",
+        "slider_center",
+        "slider_jitter",
+        "guess_value",
+        "per_slot_casts",
+        "max_casts_per_run",
+        "cast_interval",
+        "buy_lure_key",
+        "whatever",
+    ):
+        ok, _, message = normalize(key, "1")
+        assert ok is False, key
+        assert "配置页" in str(message), (key, message)
+
+
+def test_set_option_rejects_out_of_range():
+    """数值越界必须拒绝。"""
+    module = load_plugin_module()
+    normalize = getattr(module.SiQiFishingV3, "_SiQiFishingV3__normalize_option")
+
+    for key, value in (
+        ("daily_cast_limit", 0),
+        ("daily_cast_limit", 100),
+        ("keep_lures", -1),
+        ("buy_budget_per_day", -5),
+    ):
+        ok, _, message = normalize(key, value)
+        assert ok is False, (key, value)
+        assert str(message).strip(), (key, value)
+
+
+def test_set_option_rejects_bad_enum():
+    """枚举取值非法时必须拒绝。"""
+    module = load_plugin_module()
+    normalize = getattr(module.SiQiFishingV3, "_SiQiFishingV3__normalize_option")
+
+    for key, value in (
+        ("slider_mode", "wild"),
+        ("lure_key", "diamond"),
+        ("rod_fixed", "bamboo"),
+    ):
+        ok, _, message = normalize(key, value)
+        assert ok is False, (key, value)
+        assert str(message).strip(), (key, value)
+
+
+def test_set_option_rejects_bad_bool():
+    """布尔键只接受明确的真假字面量。"""
+    module = load_plugin_module()
+    normalize = getattr(module.SiQiFishingV3, "_SiQiFishingV3__normalize_option")
+
+    for key, value in (("auto_buy", "yes"), ("dry_run", 2)):
+        ok, _, message = normalize(key, value)
+        assert ok is False, (key, value)
+        assert str(message).strip(), (key, value)
+
+
+def test_set_option_bool_normalization():
+    """四种真值与三种假值都能归一化为 bool。"""
+    module = load_plugin_module()
+    normalize = getattr(module.SiQiFishingV3, "_SiQiFishingV3__normalize_option")
+
+    for raw in ("true", "True", "1", True):
+        ok, value, message = normalize("dry_run", raw)
+        assert ok is True, (raw, message)
+        assert value is True, raw
+
+    for raw in ("false", "0", False):
+        ok, value, message = normalize("dry_run", raw)
+        assert ok is True, (raw, message)
+        assert value is False, raw
+
+
+def test_set_option_persists_full_config():
+    """改单个选项时以原配置为基底整体回写，未改动的键原样保留。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._config_snapshot = make_config(
+        schedule_mode="cron", cron="7 */2 * * *", cookie="c_secure_pass=token"
+    )
+
+    result = asyncio.run(plugin.api_set_option({"key": "dry_run", "value": "true"}))
+
+    assert result.get("success") is True, result
+    assert plugin._updated_configs, "必须整体回写配置"
+    saved = plugin._updated_configs[-1]
+    assert saved["cookie"] == "c_secure_pass=token"
+    assert saved["cron"] == "7 */2 * * *"
+    assert saved["schedule_mode"] == "cron"
+    assert saved["dry_run"] is True
+
+
+def test_set_option_applies_memory_and_idempotent():
+    """改选项后内存属性立即生效，重复提交同样返回成功。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+
+    first = asyncio.run(plugin.api_set_option({"key": "dry_run", "value": "true"}))
+    assert first.get("success") is True, first
+    assert plugin._dry_run is True
+
+    second = asyncio.run(plugin.api_set_option({"key": "dry_run", "value": "true"}))
+    assert second.get("success") is True, second
+    assert plugin._dry_run is True
+
+
+def test_set_option_compound_lure_key():
+    """lure_fixed 会展开成 lure_mode=fixed 与 lure_key 两键。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._state["lures"] = {"normal": 5, "insect": 3}
+
+    result = asyncio.run(plugin.api_set_option({"key": "lure_fixed", "value": "insect"}))
+
+    assert result.get("success") is True, result
+    assert plugin._lure_mode == "fixed"
+    assert plugin._lure_key == "insect"
+    saved = plugin._updated_configs[-1]
+    assert saved["lure_mode"] == "fixed"
+    assert saved["lure_key"] == "insect"
+
+
+def test_set_option_rod_fixed_requires_unlock():
+    """未解锁鱼竿不得通过快捷操作切换。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._state["rods"] = {
+        "mushroom": {"unlocked": True},
+        "star": {"unlocked": False},
+    }
+
+    result = asyncio.run(plugin.api_set_option({"key": "rod_fixed", "value": "star"}))
+
+    assert result.get("success") is False, result
+    assert plugin._rod_mode == "auto"
+    assert plugin._rod_key == "mushroom"
+    assert plugin._updated_configs == []
+
+
+def test_set_option_config_read_failure_returns_false():
+    """读取配置失败时必须直接返回失败，不得用空配置回写。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+
+    def _boom():
+        raise RuntimeError("db down")
+
+    plugin.get_config = _boom
+
+    result = asyncio.run(plugin.api_set_option({"key": "dry_run", "value": "true"}))
+
+    assert result.get("success") is False, result
+    assert plugin._updated_configs == []
+    assert plugin._dry_run is False
+
+
+def test_set_option_update_config_failure_keeps_memory():
+    """写配置失败时不得改动内存中的选项状态。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+
+    def _boom(config):
+        raise RuntimeError("write failed")
+
+    plugin.update_config = _boom
+
+    result = asyncio.run(plugin.api_set_option({"key": "dry_run", "value": "true"}))
+
+    assert result.get("success") is False, result
+    assert plugin._dry_run is False
+    assert plugin._lure_mode == "auto"
+
+
+def test_fish_now_returns_running_when_locked(monkeypatch):
+    """运行锁被占用时立即返回 running，且不发起任何请求。"""
+    module = load_plugin_module()
+    _stub_runtime(monkeypatch, module, data=make_data(lures={"normal": 3}))
+    plugin = build_plugin(module)
+    _lock_plugin(plugin)
+
+    result = asyncio.run(plugin.api_fish_now({"casts": 1}))
+
+    assert result.get("status") == "running", result
+    assert ActionRequestUtils.calls == []
+
+
+def test_fish_now_single_cast_never_buys(monkeypatch):
+    """快捷钓一竿只抛竿，不补饵、不竞猜、不交付任务。"""
+    module = load_plugin_module()
+    _stub_runtime(
+        monkeypatch,
+        module,
+        data=make_data(
+            lures={"normal": 1},
+            tasks={"1": {"progress": {"ready": True}}},
+        ),
+        responses={
+            "perform_fishing": [cast_with_data(1) for _ in range(5)],
+            "purchase_lure": [FakeResponse(payload={"success": True})],
+            "submit_guess": [FakeResponse(payload={"success": True})],
+            "deliver_task": [FakeResponse(payload={"success": True})],
+        },
+    )
+    plugin = build_plugin(module)
+    plugin._auto_buy = True
+    plugin._buy_budget_per_day = 5000
+    plugin._keep_lures = 10
+    plugin._auto_task = True
+    plugin._auto_guess = True
+
+    asyncio.run(plugin.api_fish_now({"casts": 1}))
+
+    assert "purchase_lure" not in ActionRequestUtils.actions
+    assert "submit_guess" not in ActionRequestUtils.actions
+    assert "deliver_task" not in ActionRequestUtils.actions
+    assert ActionRequestUtils.actions.count("perform_fishing") == 1
+
+
+def test_fish_now_casts_capped(monkeypatch):
+    """快捷钓一竿的 casts 参数最多放大到 min(3, 单次上限)。"""
+    module = load_plugin_module()
+    _stub_runtime(
+        monkeypatch,
+        module,
+        data=make_data(lures={"normal": 30}),
+        responses={
+            "perform_fishing": [cast_with_data(index) for index in range(1, 8)],
+        },
+    )
+    plugin = build_plugin(module)
+
+    asyncio.run(plugin.api_fish_now({"casts": 99}))
+
+    casts = ActionRequestUtils.actions.count("perform_fishing")
+    assert casts == min(3, plugin._max_casts_per_run), casts
+
+
+def test_sync_no_casting(monkeypatch):
+    """同步接口只 GET 页面并刷新运行态，不发送任何 action。"""
+    module = load_plugin_module()
+    _stub_runtime(monkeypatch, module, data=make_data(lures={"normal": 4}))
+    plugin = build_plugin(module)
+    plugin._state["updated_at"] = None
+
+    asyncio.run(plugin.api_sync())
+
+    assert ActionRequestUtils.actions == []
+    assert plugin._state["updated_at"]
+    actions = [item.get("action") for item in plugin._daily["history"]]
+    assert "sync" in actions, actions
+
+
+def test_sync_locked_returns_running(monkeypatch):
+    """运行锁被占用时同步接口同样返回 running 且不发请求。"""
+    module = load_plugin_module()
+    _stub_runtime(monkeypatch, module, data=make_data(lures={"normal": 4}))
+    plugin = build_plugin(module)
+    _lock_plugin(plugin)
+
+    result = asyncio.run(plugin.api_sync())
+
+    assert result.get("status") == "running", result
+    assert ActionRequestUtils.calls == []
+
+
+def test_deliver_no_ready_returns_zero(monkeypatch):
+    """没有可交付任务时返回 delivered=0 且不请求交付接口。"""
+    module = load_plugin_module()
+    _stub_runtime(monkeypatch, module, data=make_data(tasks={}))
+    plugin = build_plugin(module)
+
+    result = asyncio.run(plugin.api_deliver())
+
+    assert result["data"]["delivered"] == 0, result
+    assert "deliver_task" not in ActionRequestUtils.actions
+
+
+def test_deliver_only_ready_tasks(monkeypatch):
+    """交付接口只处理 progress.ready 为真的任务。"""
+    module = load_plugin_module()
+    _stub_runtime(
+        monkeypatch,
+        module,
+        data=make_data(
+            tasks={
+                "1": {"progress": {"ready": True}},
+                "2": {"progress": {"ready": False}},
+            }
+        ),
+        responses={
+            "deliver_task": [FakeResponse(payload={"success": True}) for _ in range(3)],
+        },
+    )
+    plugin = build_plugin(module)
+
+    result = asyncio.run(plugin.api_deliver())
+
+    assert result["data"]["delivered"] == 1, result
+    bodies = [
+        body for action, body in ActionRequestUtils.calls if action == "deliver_task"
+    ]
+    assert len(bodies) == 1
+    assert str(bodies[0].get("task_id")) == "1"
+
+
+def test_page_lure_buttons_disabled_without_stock():
+    """零库存鱼饵的快捷按钮必须禁用，有库存的保持可点。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    page = _rich_page(plugin, lures={"normal": 5, "insect": 0})
+
+    empty = _option_buttons(page, "lure_fixed", "insect")
+    assert empty, "零库存鱼饵也应渲染为禁用按钮"
+    for node in empty:
+        assert (node.get("props") or {}).get("disabled") is True, node
+
+    stocked = _option_buttons(page, "lure_fixed", "normal")
+    assert stocked, "有库存鱼饵必须提供可点按钮"
+    for node in stocked:
+        assert (node.get("props") or {}).get("disabled") is not True, node
+
+
+def test_page_rod_buttons_only_unlocked():
+    """未解锁鱼竿不得出现可点的快捷按钮。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    page = _rich_page(
+        plugin,
+        rods={
+            "mushroom": {"unlocked": True},
+            "star": {"unlocked": True},
+            "love": {"unlocked": False},
+        },
+    )
+
+    assert _option_buttons(page, "rod_fixed", "star"), "已解锁鱼竿应可点"
+    assert not _option_buttons(page, "rod_fixed", "love"), "未解锁鱼竿不得可点"
+    assert "🔒" in json.dumps(page, ensure_ascii=False)
+
+
+def test_page_running_chip_when_locked():
+    """任务执行中时详情页给出运行中提示。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    _rich_page(plugin)
+    _lock_plugin(plugin)
+
+    page_text = json.dumps(plugin.get_page(), ensure_ascii=False)
+
+    assert "任务执行中" in page_text
+
+
+def test_page_quick_action_cards():
+    """详情页新增快捷操作与策略调节两张卡片。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+
+    page_text = json.dumps(_rich_page(plugin), ensure_ascii=False)
+
+    assert "⚡ 快捷操作" in page_text
+    assert "🎛 策略调节" in page_text
+
+
+def test_option_label_covers_whitelist():
+    """白名单键都能给出非空中文标签。"""
+    module = load_plugin_module()
+    label = getattr(module.SiQiFishingV3, "_SiQiFishingV3__option_label")
+
+    for key in (
+        "slider_mode",
+        "lure_mode",
+        "lure_key",
+        "rod_mode",
+        "rod_key",
+        "auto_buy",
+        "dry_run",
+        "daily_cast_limit",
+        "buy_budget_per_day",
+    ):
+        text = label(key)
+        assert isinstance(text, str) and text.strip(), key
+
+    assert isinstance(label("unknown_key"), str)
 
 
 _MISSING = object()

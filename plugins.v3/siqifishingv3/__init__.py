@@ -26,7 +26,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -80,6 +80,61 @@ class SiQiFishingV3(_PluginBase):
         "epic": "史诗",
         "legendary": "传说",
     }
+
+    # 页面快捷操作：单次最多 3 竿，且间隔压缩到 3 秒内，保证同步接口快速返回
+    MAX_QUICK_CASTS = 3
+    QUICK_CAST_INTERVAL = 3
+
+    # 详情页允许直接修改的选项；其余配置只能在配置页调整
+    OPTION_WHITELIST: Dict[str, Dict[str, Any]] = {
+        "slider_mode": {
+            "type": "enum",
+            "label": "收竿方式",
+            "values": ("perfect", "range", "custom"),
+        },
+        "lure_mode": {"type": "enum", "label": "鱼饵策略", "values": ("auto", "fixed")},
+        "lure_key": {"type": "enum", "label": "固定鱼饵", "values": tuple(LURE_META)},
+        "rod_mode": {"type": "enum", "label": "鱼竿策略", "values": ("auto", "fixed")},
+        "rod_key": {"type": "enum", "label": "固定鱼竿", "values": tuple(ROD_META)},
+        "lure_fixed": {"type": "lure_fixed", "label": "固定鱼饵"},
+        "rod_fixed": {"type": "rod_fixed", "label": "固定鱼竿"},
+        "auto_buy": {"type": "bool", "label": "自动补饵"},
+        "dry_run": {"type": "bool", "label": "演练模式"},
+        "auto_task": {"type": "bool", "label": "自动交付任务"},
+        "auto_guess": {"type": "bool", "label": "自动竞猜"},
+        "slot_spread": {"type": "bool", "label": "时段分散"},
+        "buy_budget_per_day": {
+            "type": "int",
+            "label": "每日购饵预算",
+            "min": 0,
+            "max": 1_000_000,
+        },
+        "keep_lures": {"type": "int", "label": "鱼饵保底库存", "min": 0, "max": 999},
+        "daily_cast_limit": {
+            "type": "int",
+            "label": "每日抛竿上限",
+            "min": 1,
+            "max": 99,
+        },
+    }
+
+    # 敏感或需要精调、不提供页面入口的键
+    OPTION_BLOCKED = (
+        "cookie",
+        "cron",
+        "schedule_mode",
+        "interval_minutes",
+        "enabled",
+        "notify",
+        "run_once",
+        "slider_center",
+        "slider_jitter",
+        "guess_value",
+        "per_slot_casts",
+        "max_casts_per_run",
+        "cast_interval",
+        "buy_lure_key",
+    )
 
     _enabled = False
     _cookie = ""
@@ -285,6 +340,38 @@ class SiQiFishingV3(_PluginBase):
                 "auth": "bear",
                 "summary": "查询钓鱼状态",
                 "description": "返回今日次数、鱼饵库存与最近记录",
+            },
+            {
+                "path": "/fish_now",
+                "endpoint": self.api_fish_now,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "页面快捷抛竿",
+                "description": "同步钓 1~3 竿，不补饵、不竞猜、不交付任务",
+            },
+            {
+                "path": "/sync",
+                "endpoint": self.api_sync,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "仅同步状态",
+                "description": "只抓取页面并刷新运行态，不调用任何 action 接口",
+            },
+            {
+                "path": "/set_option",
+                "endpoint": self.api_set_option,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "页面修改白名单选项",
+                "description": "仅支持白名单内的键，其余配置请进配置页",
+            },
+            {
+                "path": "/deliver",
+                "endpoint": self.api_deliver,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "交付可完成任务",
+                "description": "刷新状态后仅交付 progress.ready 的任务",
             },
         ]
 
@@ -783,7 +870,7 @@ class SiQiFishingV3(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        """详情页：Hero 概览、次数进度、统计瓦片、鱼饵库存、记录与配置摘要。"""
+        """详情页：Hero 概览、次数进度、统计瓦片、快捷操作、策略调节、鱼饵库存、记录与配置摘要。"""
         state = self._state or {}
         daily = self._daily or {}
 
@@ -880,6 +967,8 @@ class SiQiFishingV3(_PluginBase):
                     ),
                 ],
             },
+            self.__quick_actions_card(),
+            self.__strategy_tuning_card(),
             self.__lure_table(lures, selected_lure),
             self.__log_table(daily.get("history") or []),
             {
@@ -899,7 +988,7 @@ class SiQiFishingV3(_PluginBase):
                                     "variant": "tonal",
                                     "color": "primary",
                                 },
-                                "text": "可在配置页随时修改",
+                                "text": "数值类选项请进配置页修改",
                             },
                         ],
                     },
@@ -988,6 +1077,425 @@ class SiQiFishingV3(_PluginBase):
             ],
         }
 
+    def __api_path(self, path: str) -> str:
+        """拼出详情页事件可调用的插件 API 相对路径。
+
+        宿主前端使用自带 JWT 的 axios 实例调用，无需在 URL 上附带 API Token。
+        """
+        return f"plugin/{self.__class__.__name__}/{path}"
+
+    def __btn(
+        self,
+        text: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        method: str = "post",
+        color: str = "primary",
+        variant: str = "tonal",
+        size: str = "small",
+        disabled: bool = False,
+    ) -> Dict[str, Any]:
+        """构造带点击事件的 VBtn；点击后由宿主调用插件 API 并自动刷新页面。"""
+        return {
+            "component": "VBtn",
+            "props": {
+                "size": size,
+                "variant": variant,
+                "color": color,
+                "disabled": bool(disabled),
+                "class": "text-none",
+            },
+            "events": {
+                "click": {
+                    "api": self.__api_path(path),
+                    "method": method,
+                    "params": dict(params or {}),
+                }
+            },
+            "text": text,
+        }
+
+    def __option_row(
+        self, label: str, value_text: str, buttons: List[dict]
+    ) -> Dict[str, Any]:
+        """构造一行「名称 + 当前值 + 按钮组」的选项行。"""
+        return {
+            "component": "div",
+            "props": {
+                "style": (
+                    "display:flex; align-items:center; gap:10px; flex-wrap:wrap;"
+                    " padding:8px 0; border-bottom:1px dashed rgba(148,163,184,0.25);"
+                    " font-size:13px;"
+                )
+            },
+            "content": [
+                {
+                    "component": "div",
+                    "props": {
+                        "style": (
+                            "display:flex; align-items:center; gap:8px;"
+                            " flex:1 1 160px; min-width:0;"
+                        )
+                    },
+                    "content": [
+                        {
+                            "component": "span",
+                            "props": {"style": "opacity:0.75;"},
+                            "text": label,
+                        },
+                        {
+                            "component": "VChip",
+                            "props": {
+                                "size": "x-small",
+                                "variant": "tonal",
+                                "color": "primary",
+                            },
+                            "text": value_text,
+                        },
+                    ],
+                },
+                {
+                    "component": "div",
+                    "props": {
+                        "style": (
+                            "display:flex; align-items:center; gap:6px; flex-wrap:wrap;"
+                            " justify-content:flex-end;"
+                        )
+                    },
+                    "content": buttons,
+                },
+            ],
+        }
+
+    def __toggle_row(
+        self,
+        label: str,
+        key: str,
+        enabled: bool,
+        *,
+        on_text: str,
+        off_text: str,
+        on_color: str = "warning",
+        off_color: str = "success",
+    ) -> Dict[str, Any]:
+        """构造开关行：展示当前状态，按钮用于切到相反状态。"""
+        return self.__option_row(
+            label,
+            "开启" if enabled else "关闭",
+            [
+                self.__btn(
+                    off_text if enabled else on_text,
+                    "set_option",
+                    {"key": key, "value": not enabled},
+                    color=off_color if enabled else on_color,
+                )
+            ],
+        )
+
+    def __running_chip(self) -> Optional[Dict[str, Any]]:
+        """锁被占用时返回「任务执行中」徽标，空闲返回 None。"""
+        if not self.__get_lock().locked():
+            return None
+        return {
+            "component": "VChip",
+            "props": {
+                "size": "small",
+                "variant": "tonal",
+                "color": "warning",
+                "class": "ml-2",
+            },
+            "text": "⚙️ 任务执行中",
+        }
+
+    def __quick_actions_card(self) -> Dict[str, Any]:
+        """快捷操作卡：同步钓 1 竿、后台跑满一轮、仅同步、交付任务。"""
+        state = self._state or {}
+        ready = max(0, self.__safe_int(state.get("tasks_ready"), 0))
+        quick_limit = min(
+            self.MAX_QUICK_CASTS,
+            max(1, self.__safe_int(self._max_casts_per_run, 1, min_value=1)),
+        )
+        rows = [
+            self.__option_row(
+                "🎣 钓 1 竿",
+                f"最多 {quick_limit} 竿",
+                [
+                    self.__btn(
+                        "演练中·仅同步" if self._dry_run else "🎣 钓 1 竿",
+                        "fish_now",
+                        {"casts": 1},
+                        color="primary",
+                        disabled=self._dry_run,
+                    )
+                ],
+            ),
+            self.__option_row(
+                "⏱ 后台钓满一轮",
+                f"{self._max_casts_per_run} 竿/轮",
+                [
+                    self.__btn(
+                        "⏱ 后台钓满一轮",
+                        "run",
+                        {},
+                        color="secondary",
+                    )
+                ],
+            ),
+            self.__option_row(
+                "🔄 仅同步状态",
+                "只刷新数据",
+                [
+                    self.__btn(
+                        "🔄 仅同步状态",
+                        "sync",
+                        {},
+                        color="info",
+                    )
+                ],
+            ),
+            self.__option_row(
+                "📦 交付可完成任务",
+                f"{ready} 个待交付" if ready else "暂无",
+                [
+                    self.__btn(
+                        "📦 交付可完成任务" if ready else "📦 暂无可交付",
+                        "deliver",
+                        {},
+                        color="success",
+                        disabled=ready == 0,
+                    )
+                ],
+            ),
+        ]
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-4"},
+            "content": [
+                {
+                    "component": "VCardTitle",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {"component": "span", "text": "⚡ 快捷操作"},
+                        {"component": "VSpacer"},
+                        {
+                            "component": "VChip",
+                            "props": {
+                                "size": "small",
+                                "variant": "tonal",
+                                "color": "info",
+                            },
+                            "text": "点击后自动刷新页面",
+                        },
+                    ],
+                },
+                {"component": "VCardText", "content": rows},
+            ],
+        }
+
+    def __rod_unlocked(self, key: str) -> bool:
+        """判断站点返回的鱼竿信息中该鱼竿是否已解锁。"""
+        rods = self._state.get("rods") or {}
+        info = rods.get(key) if isinstance(rods, dict) else None
+        if not isinstance(info, dict):
+            return False
+        return bool(info.get("unlocked"))
+
+    def __strategy_tuning_card(self) -> Dict[str, Any]:
+        """策略调节卡：常用选项点击即改，数值精调仍回配置页。"""
+        state = self._state or {}
+        lures = state.get("lures") or {}
+
+        slider_text = {
+            "perfect": "完美 0.50",
+            "range": "甜蜜区随机",
+            "custom": f"自定义 {self._slider_center:.2f}",
+        }.get(self._slider_mode, str(self._slider_mode))
+        slider_buttons = [
+            self.__btn(
+                {"perfect": "完美 0.50", "range": "甜蜜区随机", "custom": "自定义"}[mode],
+                "set_option",
+                {"key": "slider_mode", "value": mode},
+                disabled=self._slider_mode == mode,
+            )
+            for mode in ("perfect", "range", "custom")
+        ]
+
+        selected_lure = state.get("selected_lure") or ""
+        lure_text = (
+            f"自动（{self.LURE_META.get(selected_lure, {}).get('name', '未选')}）"
+            if self._lure_mode == "auto"
+            else f"固定 {self.LURE_META.get(self._lure_key, {}).get('name', self._lure_key)}"
+        )
+        lure_buttons: List[Dict[str, Any]] = [
+            self.__btn(
+                "自动",
+                "set_option",
+                {"key": "lure_mode", "value": "auto"},
+                color="secondary",
+                disabled=self._lure_mode == "auto",
+            )
+        ]
+        for key, meta in self.LURE_META.items():
+            stock = max(0, self.__safe_int(lures.get(key), 0))
+            chosen = self._lure_mode == "fixed" and self._lure_key == key
+            lure_buttons.append(
+                self.__btn(
+                    f"{meta['icon']} {meta['name']}" + ("(库存0)" if stock <= 0 else ""),
+                    "set_option",
+                    {"key": "lure_fixed", "value": key},
+                    disabled=chosen or stock <= 0,
+                )
+            )
+
+        rod_text = (
+            "自动选最强已解锁"
+            if self._rod_mode == "auto"
+            else f"固定 {self.ROD_META.get(self._rod_key, {}).get('name', self._rod_key)}"
+        )
+        rod_buttons: List[Dict[str, Any]] = [
+            self.__btn(
+                "自动",
+                "set_option",
+                {"key": "rod_mode", "value": "auto"},
+                color="secondary",
+                disabled=self._rod_mode == "auto",
+            )
+        ]
+        for key, meta in self.ROD_META.items():
+            if not self.__rod_unlocked(key):
+                rod_buttons.append(
+                    {
+                        "component": "span",
+                        "props": {"style": "font-size:12px; opacity:0.6;"},
+                        "text": f"🔒 {meta['name']}",
+                    }
+                )
+                continue
+            chosen = self._rod_mode == "fixed" and self._rod_key == key
+            rod_buttons.append(
+                self.__btn(
+                    f"{meta['icon']} {meta['name']}",
+                    "set_option",
+                    {"key": "rod_fixed", "value": key},
+                    disabled=chosen,
+                )
+            )
+
+        budget_buttons: List[Dict[str, Any]] = [
+            self.__btn(
+                f"{amount}",
+                "set_option",
+                {"key": "buy_budget_per_day", "value": amount},
+                disabled=self._buy_budget_per_day == amount,
+            )
+            for amount in (0, 5000, 20000)
+        ]
+        budget_buttons.append(self.__hint_span("自定义预算请进配置页"))
+
+        keep_buttons: List[Dict[str, Any]] = [
+            self.__btn(
+                f"{amount}",
+                "set_option",
+                {"key": "keep_lures", "value": amount},
+                disabled=self._keep_lures == amount,
+            )
+            for amount in (10, 20, 50)
+        ]
+        keep_buttons.append(self.__hint_span("自定义数值请进配置页"))
+
+        daily_buttons: List[Dict[str, Any]] = [
+            self.__btn(
+                f"{amount}",
+                "set_option",
+                {"key": "daily_cast_limit", "value": amount},
+                disabled=self._daily_cast_limit == amount,
+            )
+            for amount in (6, 12, 24, 33)
+        ]
+        daily_buttons.append(self.__hint_span("自定义数值请进配置页"))
+
+        rows = [
+            self.__option_row("收竿方式", slider_text, slider_buttons),
+            self.__option_row("鱼饵策略", lure_text, lure_buttons),
+            self.__option_row("鱼竿策略", rod_text, rod_buttons),
+            self.__toggle_row(
+                "自动补饵",
+                "auto_buy",
+                self._auto_buy,
+                on_text="开启补饵",
+                off_text="关闭补饵",
+            ),
+            self.__option_row(
+                "每日购饵预算", f"{self._buy_budget_per_day} 魔力", budget_buttons
+            ),
+            self.__option_row("鱼饵保底库存", f"{self._keep_lures} 枚", keep_buttons),
+            self.__option_row(
+                "每日抛竿上限", f"{self._daily_cast_limit} 次", daily_buttons
+            ),
+            self.__toggle_row(
+                "演练模式",
+                "dry_run",
+                self._dry_run,
+                on_text="开启演练",
+                off_text="关闭演练",
+            ),
+            self.__toggle_row(
+                "自动交付任务",
+                "auto_task",
+                self._auto_task,
+                on_text="开启自动交付",
+                off_text="关闭自动交付",
+            ),
+            self.__toggle_row(
+                "自动竞猜",
+                "auto_guess",
+                self._auto_guess,
+                on_text="开启自动竞猜",
+                off_text="关闭自动竞猜",
+            ),
+            self.__toggle_row(
+                "时段分散",
+                "slot_spread",
+                self._slot_spread,
+                on_text="开启时段分散",
+                off_text="关闭时段分散",
+            ),
+        ]
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-4"},
+            "content": [
+                {
+                    "component": "VCardTitle",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {"component": "span", "text": "🎛 策略调节"},
+                        {"component": "VSpacer"},
+                        {
+                            "component": "VChip",
+                            "props": {
+                                "size": "small",
+                                "variant": "tonal",
+                                "color": "primary",
+                            },
+                            "text": "点击即生效",
+                        },
+                    ],
+                },
+                {"component": "VCardText", "content": rows},
+            ],
+        }
+
+    @staticmethod
+    def __hint_span(text: str) -> Dict[str, Any]:
+        """构造行尾的灰色提示文字。"""
+        return {
+            "component": "span",
+            "props": {"style": "font-size:12px; opacity:0.6;"},
+            "text": text,
+        }
+
     def __hero_card(
         self,
         catches: int,
@@ -1040,6 +1548,47 @@ class SiQiFishingV3(_PluginBase):
             if last_result:
                 summary += f" ｜ 📝 {last_result}"
 
+        content: List[Dict[str, Any]] = [
+            {
+                "component": "div",
+                "props": {"style": "font-size: 13px; opacity: 0.9; letter-spacing: 1px;"},
+                "text": "🎣 思齐钓鱼",
+            },
+            {
+                "component": "div",
+                "props": {
+                    "style": "display:flex; align-items:baseline; gap:10px; margin:6px 0 10px 0;"
+                },
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"style": "font-size: 44px; font-weight: 800; line-height: 1;"},
+                        "text": f"{catches:,}条",
+                    },
+                    {
+                        "component": "div",
+                        "props": {"style": "font-size: 14px; opacity: 0.85;"},
+                        "text": "今日已钓",
+                    },
+                ],
+            },
+            {"component": "div", "props": {"style": "margin-bottom:8px;"}, "content": pills},
+            {
+                "component": "div",
+                "props": {"style": "font-size: 13px; opacity: 0.9;"},
+                "text": summary,
+            },
+        ]
+        running = self.__running_chip()
+        if running:
+            content.append(
+                {
+                    "component": "div",
+                    "props": {"style": "margin-top:10px;"},
+                    "content": [running],
+                }
+            )
+
         return {
             "component": "div",
             "props": {
@@ -1049,39 +1598,7 @@ class SiQiFishingV3(_PluginBase):
                     " color: #ffffff; box-shadow: 0 8px 24px rgba(37, 99, 235, 0.25);"
                 )
             },
-            "content": [
-                {
-                    "component": "div",
-                    "props": {"style": "font-size: 13px; opacity: 0.9; letter-spacing: 1px;"},
-                    "text": "🎣 思齐钓鱼",
-                },
-                {
-                    "component": "div",
-                    "props": {
-                        "style": "display:flex; align-items:baseline; gap:10px; margin:6px 0 10px 0;"
-                    },
-                    "content": [
-                        {
-                            "component": "div",
-                            "props": {
-                                "style": "font-size: 44px; font-weight: 800; line-height: 1;"
-                            },
-                            "text": f"{catches:,}条",
-                        },
-                        {
-                            "component": "div",
-                            "props": {"style": "font-size: 14px; opacity: 0.85;"},
-                            "text": "今日已钓",
-                        },
-                    ],
-                },
-                {"component": "div", "props": {"style": "margin-bottom:8px;"}, "content": pills},
-                {
-                    "component": "div",
-                    "props": {"style": "font-size: 13px; opacity: 0.9;"},
-                    "text": summary,
-                },
-            ],
+            "content": content,
         }
 
     def __attempt_progress_card(self, used: int, limit: int) -> Dict[str, Any]:
@@ -1383,6 +1900,209 @@ class SiQiFishingV3(_PluginBase):
         """API：返回今日统计与运行态快照。"""
         return {"success": True, "data": {"daily": self._daily, "state": self._state}}
 
+    async def api_fish_now(
+        self, payload: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """API：页面快捷钓 1~3 竿，不补饵、不竞猜、不交付任务。"""
+        payload = payload if isinstance(payload, dict) else {}
+        limit = min(
+            self.MAX_QUICK_CASTS,
+            max(1, self.__safe_int(self._max_casts_per_run, 1, min_value=1)),
+        )
+        casts = min(max(1, self.__safe_int(payload.get("casts"), 1)), limit)
+        lock = self.__get_lock()
+        if lock.locked():
+            logger.warning("思齐钓鱼：快捷抛竿被跳过，已有任务执行中")
+            return {
+                "success": False,
+                "status": "running",
+                "message": "已有钓鱼任务正在执行，请稍后再试",
+            }
+
+        async with lock:
+            result = self.__new_result()
+            try:
+                await self.__execute(
+                    result,
+                    casts_limit=casts,
+                    interval_override=min(
+                        self._cast_interval, self.QUICK_CAST_INTERVAL
+                    ),
+                    allow_buy=False,
+                    allow_guess=False,
+                    allow_deliver=False,
+                )
+            except httpx2.TimeoutException:
+                result["status"] = "error"
+                result["message"] = "请求超时"
+                logger.error("思齐钓鱼：快捷抛竿请求超时")
+            except httpx2.RequestError as e:
+                result["status"] = "error"
+                result["message"] = f"请求异常：{e}"
+                logger.error(f"思齐钓鱼：快捷抛竿请求异常：{e}")
+            except Exception as e:
+                result["status"] = "error"
+                result["message"] = f"执行异常：{e}"
+                logger.error(f"思齐钓鱼：快捷抛竿执行异常：{e}")
+
+            self.__finish_task(result)
+
+        response = dict(result)
+        response["success"] = result.get("status") == "completed"
+        return response
+
+    async def api_sync(self) -> Dict[str, Any]:
+        """API：只同步站点状态，绝不调用任何 action 接口。"""
+        lock = self.__get_lock()
+        if lock.locked():
+            return {
+                "success": False,
+                "status": "running",
+                "message": "已有钓鱼任务正在执行，请稍后再试",
+            }
+
+        async with lock:
+            try:
+                cookie = self._cookie or await self.__get_site_cookie_async()
+                if not cookie or "c_secure_pass=" not in cookie:
+                    return {
+                        "success": False,
+                        "message": "缺少包含 c_secure_pass 的思齐 Cookie，请检查配置或站点管理",
+                    }
+                self._daily = self.__roll_daily(
+                    self._daily, datetime.now(self.TZ_CN).strftime("%Y-%m-%d")
+                )
+                client = self.__build_client(cookie, self.__game_headers(), 20)
+                data = self.__parse_state(await self.__fetch_page(client))
+                if not data:
+                    return {
+                        "success": False,
+                        "message": "无法读取钓鱼页面，请检查 Cookie 是否失效",
+                    }
+                self.__apply_state(data)
+                self.__record("sync", "手动同步状态")
+                self.__save_state()
+            except httpx2.TimeoutException:
+                logger.error("思齐钓鱼：同步状态请求超时")
+                return {"success": False, "message": "请求超时"}
+            except httpx2.RequestError as e:
+                logger.error(f"思齐钓鱼：同步状态请求异常：{e}")
+                return {"success": False, "message": f"请求异常：{e}"}
+            except Exception as e:
+                logger.error(f"思齐钓鱼：同步状态执行异常：{e}")
+                return {"success": False, "message": f"同步失败：{e}"}
+
+        state = self._state or {}
+        return {
+            "success": True,
+            "message": "已同步状态",
+            "data": {
+                "attempts_used": state.get("attempts_used"),
+                "attempts_limit": state.get("attempts_limit"),
+                "catches": state.get("catches"),
+                "lures": state.get("lures"),
+                "tasks_ready": state.get("tasks_ready"),
+                "updated_at": state.get("updated_at"),
+            },
+        }
+
+    async def api_set_option(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """API：页面修改白名单选项，整体回写配置并同步内存属性。"""
+        payload = payload if isinstance(payload, dict) else {}
+        key = str(payload.get("key") or "").strip()
+        value = payload.get("value")
+        ok, normalized, label = self.__normalize_option(key, value)
+        if not ok:
+            logger.warning(f"思齐钓鱼：页面修改选项被拒绝：{label}")
+            return {"success": False, "message": label, "data": {"key": key}}
+
+        if key == "rod_fixed" and not self.__rod_unlocked(normalized["rod_key"]):
+            return {"success": False, "message": "鱼竿未解锁", "data": {"key": key}}
+
+        try:
+            config = dict(self.get_config() or {})
+        except Exception as e:
+            logger.error(f"思齐钓鱼：读取配置失败，未保存：{e}")
+            return {
+                "success": False,
+                "message": "读取配置失败，未保存",
+                "data": {"key": key},
+            }
+        updates = (
+            dict(normalized) if isinstance(normalized, dict) else {key: normalized}
+        )
+        config.update(updates)
+        try:
+            self.update_config(config)
+        except Exception as e:
+            logger.error(f"思齐钓鱼：保存选项失败：{e}")
+            return {
+                "success": False,
+                "message": f"保存失败：{e}",
+                "data": {"key": key},
+            }
+
+        for field, field_value in updates.items():
+            setattr(self, f"_{field}", field_value)
+        logger.info(f"思齐钓鱼：页面已更新{label}")
+        return {
+            "success": True,
+            "message": f"已更新{label}",
+            "data": {"key": key, "value": normalized},
+        }
+
+    async def api_deliver(self) -> Dict[str, Any]:
+        """API：刷新状态后仅交付 progress.ready 的任务。"""
+        lock = self.__get_lock()
+        if lock.locked():
+            return {
+                "success": False,
+                "status": "running",
+                "message": "已有钓鱼任务正在执行，请稍后再试",
+            }
+
+        async with lock:
+            try:
+                cookie = self._cookie or await self.__get_site_cookie_async()
+                if not cookie or "c_secure_pass=" not in cookie:
+                    return {
+                        "success": False,
+                        "message": "缺少包含 c_secure_pass 的思齐 Cookie，请检查配置或站点管理",
+                    }
+                self._daily = self.__roll_daily(
+                    self._daily, datetime.now(self.TZ_CN).strftime("%Y-%m-%d")
+                )
+                client = self.__build_client(cookie, self.__game_headers(), 20)
+                data = self.__parse_state(await self.__fetch_page(client))
+                if not data:
+                    return {
+                        "success": False,
+                        "message": "无法读取钓鱼页面，请检查 Cookie 是否失效",
+                    }
+                self.__apply_state(data)
+                ready = self.__safe_int(self._state.get("tasks_ready"), 0)
+                if ready <= 0:
+                    self.__save_state()
+                    return {
+                        "success": True,
+                        "data": {"delivered": 0},
+                        "message": "当前没有可交付的任务",
+                    }
+                delivered = await self.__deliver_tasks(client)
+                self.__save_state()
+            except httpx2.TimeoutException:
+                logger.error("思齐钓鱼：交付任务请求超时")
+                return {"success": False, "message": "请求超时"}
+            except httpx2.RequestError as e:
+                logger.error(f"思齐钓鱼：交付任务请求异常：{e}")
+                return {"success": False, "message": f"请求异常：{e}"}
+            except Exception as e:
+                logger.error(f"思齐钓鱼：交付任务执行异常：{e}")
+                return {"success": False, "message": f"交付失败：{e}"}
+
+        message = f"已交付 {delivered} 个任务" if delivered else "任务交付未成功"
+        return {"success": True, "data": {"delivered": delivered}, "message": message}
+
     async def run_fishing_task(self, **kwargs) -> Dict[str, Any]:
         """执行一次任务：同步状态、补饵、选饵选竿、抛竿、交付任务。"""
         lock = self.__get_lock()
@@ -1406,7 +2126,16 @@ class SiQiFishingV3(_PluginBase):
             self.__finish_task(result)
             return result
 
-    async def __execute(self, result: Dict[str, Any]) -> None:
+    async def __execute(
+        self,
+        result: Dict[str, Any],
+        *,
+        casts_limit: Optional[int] = None,
+        interval_override: Optional[int] = None,
+        allow_buy: bool = True,
+        allow_guess: bool = True,
+        allow_deliver: bool = True,
+    ) -> None:
         cookie = self._cookie or await self.__get_site_cookie_async()
         if not cookie or "c_secure_pass=" not in cookie:
             result["status"] = "auth_failed"
@@ -1441,13 +2170,15 @@ class SiQiFishingV3(_PluginBase):
             self.__record("sync", result["message"])
             return
 
-        if self._auto_guess:
+        if allow_guess and self._auto_guess:
             await self.__submit_guess(client)
 
-        await self.__ensure_lure(client)
+        await self.__ensure_lure(client, allow_buy=allow_buy)
         await self.__ensure_rod(client)
 
-        cast_result = await self.__cast_loop(client)
+        cast_result = await self.__cast_loop(
+            client, max_casts=casts_limit, interval=interval_override
+        )
         result["data"]["casts"] = cast_result["casts"]
         result["data"]["caught"] = cast_result["caught"]
         result["data"]["new_discoveries"] = cast_result["new_discoveries"]
@@ -1455,7 +2186,7 @@ class SiQiFishingV3(_PluginBase):
         result["data"]["miss_rewards"] = cast_result["miss_rewards"]
         result["data"]["spent"] = self.__safe_int(self._daily.get("spent"), 0)
 
-        if self._auto_task:
+        if allow_deliver and self._auto_task:
             delivered = await self.__deliver_tasks(client)
             result["data"]["delivered"] = delivered
 
@@ -1474,7 +2205,15 @@ class SiQiFishingV3(_PluginBase):
         self._daily["last_result"] = summary
         self.__record("run", summary)
 
-    async def __cast_loop(self, client: AsyncRequestUtils) -> Dict[str, Any]:
+    async def __cast_loop(
+        self,
+        client: AsyncRequestUtils,
+        *,
+        max_casts: Optional[int] = None,
+        interval: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        cast_limit = max_casts or self._max_casts_per_run
+        wait = self._cast_interval if interval is None else interval
         casts = 0
         caught = 0
         new_discoveries = 0
@@ -1483,7 +2222,7 @@ class SiQiFishingV3(_PluginBase):
         status = "completed"
         failure = ""
 
-        while casts < self._max_casts_per_run:
+        while casts < cast_limit:
             # 每竿重算时段，避免跨 4 小时边界后仍记在旧时段
             slot_now = str(self.__time_slot(datetime.now(self.TZ_CN).hour))
             if not isinstance(self._daily.get("slots"), dict):
@@ -1512,7 +2251,7 @@ class SiQiFishingV3(_PluginBase):
                 failure = "本时段已达上限"
                 break
             allowed = self.__allowed_casts(
-                self._max_casts_per_run - casts,
+                cast_limit - casts,
                 self._daily["casts"],
                 self._daily_cast_limit,
                 slot_used if self._slot_spread else 0,
@@ -1585,8 +2324,8 @@ class SiQiFishingV3(_PluginBase):
                 self._daily["misses"] += 1
                 self.__record("miss", "鱼儿溜走了")
 
-            if self._cast_interval > 0:
-                await asyncio.sleep(self._cast_interval)
+            if wait > 0:
+                await asyncio.sleep(wait)
 
         remaining = max(
             0,
@@ -1606,7 +2345,9 @@ class SiQiFishingV3(_PluginBase):
             "failure": failure,
         }
 
-    async def __ensure_lure(self, client: AsyncRequestUtils) -> None:
+    async def __ensure_lure(
+        self, client: AsyncRequestUtils, *, allow_buy: bool = True
+    ) -> None:
         """按策略补饵并选中本次要用的鱼饵。"""
         lures = self._state.get("lures") or {}
         key = self.__pick_lure(lures, self._lure_mode, self._lure_key)
@@ -1615,7 +2356,7 @@ class SiQiFishingV3(_PluginBase):
         buy_key = self._lure_key if self._lure_mode == "fixed" else self._buy_lure_key
         price = self.__safe_int(self.LURE_META.get(buy_key, {}).get("price"), 0)
         quantity = 0
-        if self._auto_buy and self._buy_budget_per_day > 0:
+        if allow_buy and self._auto_buy and self._buy_budget_per_day > 0:
             quantity = self.__buy_quantity(
                 self.__safe_int(lures.get(buy_key), 0),
                 self._keep_lures,
@@ -1765,6 +2506,87 @@ class SiQiFishingV3(_PluginBase):
         if timing == "normal":
             return "正常"
         return str(timing or "未知")
+
+    @staticmethod
+    def __option_label(key: str) -> str:
+        """选项键 → 中文名；未知键回退为原始键。"""
+        name = str(key or "").strip()
+        spec = SiQiFishingV3.OPTION_WHITELIST.get(name)
+        if isinstance(spec, dict) and spec.get("label"):
+            return str(spec["label"])
+        return name
+
+    @staticmethod
+    def __normalize_option(key: str, value: Any) -> Tuple[bool, Any, str]:
+        """校验页面提交的选项。
+
+        返回 ``(是否通过, 归一化值, 中文项名或失败原因)``；复合键展开为多字段字典，
+        拒绝时不返回任何可落库的值。纯函数，不访问实例状态。
+        """
+        name = str(key or "").strip()
+        if not name:
+            return False, None, "缺少选项名，请进配置页调整"
+        if name in SiQiFishingV3.OPTION_BLOCKED:
+            return False, None, f"「{name}」只能在配置页修改"
+        spec = SiQiFishingV3.OPTION_WHITELIST.get(name)
+        if not isinstance(spec, dict):
+            return False, None, f"选项「{name}」不支持页面修改，请进配置页调整"
+
+        label = str(spec.get("label") or name)
+        kind = spec.get("type")
+
+        if kind == "enum":
+            text = str(value if value is not None else "").strip()
+            values = tuple(spec.get("values") or ())
+            if text not in values:
+                return False, None, f"{label}仅支持：{' / '.join(values)}"
+            return True, text, label
+
+        if kind == "lure_fixed":
+            text = str(value if value is not None else "").strip()
+            if text not in SiQiFishingV3.LURE_META:
+                return False, None, f"{label}仅支持：{' / '.join(SiQiFishingV3.LURE_META)}"
+            return True, {"lure_mode": "fixed", "lure_key": text}, label
+
+        if kind == "rod_fixed":
+            text = str(value if value is not None else "").strip()
+            if text not in SiQiFishingV3.ROD_META:
+                return False, None, f"{label}仅支持：{' / '.join(SiQiFishingV3.ROD_META)}"
+            return True, {"rod_mode": "fixed", "rod_key": text}, label
+
+        if kind == "bool":
+            if isinstance(value, bool):
+                return True, value, label
+            if isinstance(value, int) and value in (0, 1):
+                return True, bool(value), label
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if text in ("true", "false"):
+                    return True, text == "true", label
+                if text in ("1", "0"):
+                    return True, text == "1", label
+            return False, None, f"{label}仅支持 true / false"
+
+        if kind == "int":
+            lower = int(spec.get("min", 0))
+            upper = int(spec.get("max", 0))
+            number: Optional[int] = None
+            if isinstance(value, bool):
+                number = None
+            elif isinstance(value, int):
+                number = value
+            elif isinstance(value, float):
+                number = int(value)
+            elif isinstance(value, str):
+                try:
+                    number = int(value.strip())
+                except ValueError:
+                    number = None
+            if number is None or number < lower or number > upper:
+                return False, None, f"{label}需为 {lower}~{upper} 的整数"
+            return True, number, label
+
+        return False, None, f"{label}只能在配置页修改"
 
     async def __fetch_page(self, client: AsyncRequestUtils) -> str:
         """抓取钓鱼页面的原始 HTML；网络异常不在此处吞掉，交由调用方分类。"""
