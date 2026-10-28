@@ -1,14 +1,15 @@
 {
   "SiQiCleanBeachV3": {
-    "name": "思齐自动收垃圾",
-    "description": "自动在思齐站点清理沙滩并收集垃圾，支持Cron和间隔定时。",
+    "name": "思齐炼魔丸",
+    "description": "自动搬砖、清理沙滩并炼造魔丸，支持定时与手动触发。",
     "labels": "站点,工具",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "Moviepilot_A.png",
     "author": "bfjy",
     "level": 2,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.2.0": "新增自动炼造：按库存递归规划炼造魔丸，支持目标数量与手动触发；插件更名为思齐炼魔丸。",
       "v1.1.0": "新增自动搬砖：每日自动搬满 50 块，支持单次上限与手动触发。",
       "v1.0.0": "首次发布：基于 SiQiCleanBeach 移植到 MoviePilot V3 SDK。"
     }

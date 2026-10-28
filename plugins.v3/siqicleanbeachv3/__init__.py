@@ -1,6 +1,7 @@
-# __init__.py - 思齐自动收垃圾（MoviePilot V3）
+# __init__.py - 思齐炼魔丸（MoviePilot V3）
 import asyncio
 import json
+import math
 import re
 import time
 from datetime import datetime
@@ -20,12 +21,12 @@ from app.sdk.plugin import _PluginBase
 
 
 class SiQiCleanBeachV3(_PluginBase):
-    """思齐站点自动清理沙滩并收集垃圾的 V3 插件。"""
+    """思齐站点自动搬砖、清理沙滩并炼造魔丸的 V3 插件。"""
 
-    plugin_name = "思齐自动收垃圾"
-    plugin_desc = "自动在思齐站点清理沙滩并收集垃圾，支持Cron和间隔定时。"
+    plugin_name = "思齐炼魔丸"
+    plugin_desc = "自动搬砖、清理沙滩并炼造魔丸，支持定时与手动触发。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "bfjy"
     author_url = "https://bfjy2024.github.io/bfjy"
     plugin_config_prefix = "siqicleanbeachv3_"
@@ -55,8 +56,25 @@ class SiQiCleanBeachV3(_PluginBase):
     _brick_enabled = True
     _brick_max_per_run = 50
 
+    # 炼造：单次请求上限与规划约束
+    CRAFT_INTERVAL = 0.4
+    CRAFT_MAX_QUANTITY = 100
+    CRAFT_MAX_PILLS = 10
+    CRAFT_MAX_DEPTH = 8
+    CRAFT_MAX_STEPS = 200
+    CRAFT_RESULT_ITEM = "魔丸"
+
+    _craft_enabled = True
+    _craft_target_pills = 1
+
     # 一次性调度任务的固定 ID，停用时需全部移除
-    ONCE_JOB_IDS = ("run_once", "api_run_once", "command_run_once", "brick_run_once")
+    ONCE_JOB_IDS = (
+        "run_once",
+        "api_run_once",
+        "command_run_once",
+        "brick_run_once",
+        "craft_run_once"
+    )
 
     # 运行态：并发锁按需创建并缓存的单实例对象（宿主当前为单事件循环模型），
     # 状态通过基类 save_data 持久化
@@ -74,6 +92,12 @@ class SiQiCleanBeachV3(_PluginBase):
         "last_result": "",
         "total_items_count": 0,
         "history": []
+    }
+    _craft: Dict[str, Any] = {
+        "last_craft": [],
+        "pills_total": 0,
+        "last_message": "",
+        "last_update": None
     }
 
     ITEM_ICONS = {
@@ -126,6 +150,11 @@ class SiQiCleanBeachV3(_PluginBase):
                 config.get("brick_max_per_run"), self.BRICK_MAX_DAILY, min_value=1
             )
         )
+        self._craft_enabled = bool(config.get("craft_enabled", True))
+        self._craft_target_pills = min(
+            self.CRAFT_MAX_PILLS,
+            self.__safe_int(config.get("craft_target_pills"), 1, min_value=1)
+        )
 
         self._bricks = {
             "daily": 0,
@@ -174,10 +203,26 @@ class SiQiCleanBeachV3(_PluginBase):
                 k: v for k, v in saved_inventory.items() if k != "砖块"
             }
 
+        self._craft = {
+            "last_craft": [],
+            "pills_total": 0,
+            "last_message": "",
+            "last_update": None
+        }
+        saved_craft = self.get_data("craft")
+        if isinstance(saved_craft, dict):
+            self._craft["last_craft"] = list(saved_craft.get("last_craft") or [])
+            self._craft["pills_total"] = self.__safe_int(
+                saved_craft.get("pills_total"), 0
+            )
+            self._craft["last_message"] = saved_craft.get("last_message") or ""
+            self._craft["last_update"] = saved_craft.get("last_update")
+
         logger.info(
-            f"思齐自动收垃圾插件初始化完成：enabled={self._enabled}, "
+            f"思齐炼魔丸插件初始化完成：enabled={self._enabled}, "
             f"schedule_mode={self._schedule_mode}, interval_minutes={self._interval_minutes}, "
-            f"brick_enabled={self._brick_enabled}, brick_max_per_run={self._brick_max_per_run}"
+            f"brick_enabled={self._brick_enabled}, brick_max_per_run={self._brick_max_per_run}, "
+            f"craft_enabled={self._craft_enabled}, craft_target_pills={self._craft_target_pills}"
         )
 
         if config.get("run_once"):
@@ -187,7 +232,7 @@ class SiQiCleanBeachV3(_PluginBase):
                 self.__class__.__name__,
                 "run_once",
                 self.run_clean_task,
-                "思齐自动收垃圾立即运行",
+                "思齐炼魔丸立即运行",
                 delay_seconds=3,
             )
 
@@ -209,7 +254,7 @@ class SiQiCleanBeachV3(_PluginBase):
         ]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """注册立即执行、手动搬砖与统计数据查询接口。"""
+        """注册立即执行、手动搬砖、手动炼造与统计数据查询接口。"""
         return [
             {
                 "path": "/run",
@@ -228,12 +273,20 @@ class SiQiCleanBeachV3(_PluginBase):
                 "description": "按当前额度提交一次搬砖任务，不阻塞请求。"
             },
             {
+                "path": "/craft",
+                "endpoint": self.craft_api,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "手动炼造魔丸",
+                "description": "按当前库存提交一次炼造任务，不阻塞请求。"
+            },
+            {
                 "path": "/stats",
                 "endpoint": self.get_stats_api,
                 "methods": ["GET"],
                 "auth": "bear",
-                "summary": "获取收垃圾统计数据",
-                "description": "获取思齐收垃圾的统计数据。"
+                "summary": "获取清理沙滩统计数据",
+                "description": "获取思齐炼魔丸的清理与炼造统计数据。"
             }
         ]
 
@@ -261,7 +314,7 @@ class SiQiCleanBeachV3(_PluginBase):
 
         return [{
             "id": self.__class__.__name__,
-            "name": "思齐自动收垃圾",
+            "name": "思齐炼魔丸",
             "trigger": trigger,
             "func": self.run_clean_task,
             "kwargs": {}
@@ -410,6 +463,43 @@ class SiQiCleanBeachV3(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "craft_enabled",
+                                            "label": "自动炼造",
+                                            "hint": "清理结束后按库存自动炼造魔丸"
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "craft_target_pills",
+                                            "label": "目标魔丸数",
+                                            "type": "number",
+                                            "min": 1,
+                                            "max": 10,
+                                            "hint": "每次任务的目标魔丸数量（1-10）",
+                                            "value": 1
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -437,6 +527,8 @@ class SiQiCleanBeachV3(_PluginBase):
             "notify": self._notify,
             "brick_enabled": self._brick_enabled,
             "brick_max_per_run": self._brick_max_per_run,
+            "craft_enabled": self._craft_enabled,
+            "craft_target_pills": self._craft_target_pills,
             "run_once": False
         }
 
@@ -485,7 +577,7 @@ class SiQiCleanBeachV3(_PluginBase):
                 "content": [
                     {
                         "component": "VCardTitle",
-                        "text": "🏖️ 思齐收垃圾数据面板"
+                        "text": "🏖️ 思齐炼魔丸数据面板"
                     },
                     {
                         "component": "VCardText",
@@ -509,6 +601,14 @@ class SiQiCleanBeachV3(_PluginBase):
                                         f"{brick_daily}/{self.BRICK_MAX_DAILY}", "", "deep-purple"
                                     ),
                                     self.__stat_card("👝", "口袋砖块", f"{brick_pocket:,}", "块", "secondary"),
+                                    self.__stat_card(
+                                        "⚗️", "魔丸",
+                                        f"{self.__item_count('魔丸'):,}", "颗", "purple"
+                                    ),
+                                    self.__stat_card(
+                                        "🥚", "魔丸胚胎",
+                                        f"{self.__item_count('魔丸胚胎'):,}", "个", "amber-darken-2"
+                                    ),
                                 ]
                             }
                         ]
@@ -736,6 +836,13 @@ class SiQiCleanBeachV3(_PluginBase):
             ]
         }
 
+    def __item_count(self, name: str) -> int:
+        """读取库存中某个物品的数量，兼容字典与整数两种存储形式。"""
+        entry = (self._inventory or {}).get(name)
+        if isinstance(entry, dict):
+            return max(0, self.__safe_int(entry.get("count"), 0))
+        return max(0, self.__safe_int(entry, 0))
+
     @staticmethod
     def __info_col(label: str, value: Any) -> Dict[str, Any]:
         return {
@@ -803,13 +910,13 @@ class SiQiCleanBeachV3(_PluginBase):
     async def run_once_api(self) -> Dict[str, Any]:
         """API：提交一次清理任务，不阻塞请求。"""
         if self.__get_lock().locked():
-            return {"success": False, "message": "已有收垃圾任务正在执行"}
+            return {"success": False, "message": "已有清理任务正在执行"}
         logger.info("收到 API 立即执行请求，提交一次性调度任务")
         scheduler_sdk.add_plugin_once_job(
             self.__class__.__name__,
             "api_run_once",
             self.run_clean_task,
-            "思齐自动收垃圾API立即运行",
+            "思齐炼魔丸API立即运行",
             delay_seconds=1,
         )
         return {"success": True, "message": "任务已开始，完成后会发送通知"}
@@ -840,6 +947,71 @@ class SiQiCleanBeachV3(_PluginBase):
             success=True, message="搬砖任务已提交，完成后会发送通知"
         )
 
+    async def craft_api(self) -> Dict[str, Any]:
+        """API：提交一次炼造任务，不阻塞请求。"""
+        if self.__get_lock().locked():
+            return {"success": False, "message": "已有任务正在执行"}
+        logger.info("收到 API 手动炼造请求，提交一次性调度任务")
+        scheduler_sdk.add_plugin_once_job(
+            self.__class__.__name__,
+            "craft_run_once",
+            self.__run_craft_task,
+            "思齐手动炼造",
+            delay_seconds=1,
+        )
+        return {"success": True, "message": "炼造任务已提交，完成后会发送通知"}
+
+    async def __run_craft_task(self):
+        """一次性任务：手动炼造并记录结果，与清理任务共用并发锁。"""
+        lock = self.__get_lock()
+        if lock.locked():
+            logger.warning("已有任务正在执行，跳过手动炼造")
+            return
+        async with lock:
+            cookie = (self._cookie or await self.__get_site_cookie_async() or "").strip()
+            if not cookie or "c_secure_pass=" not in cookie:
+                logger.warning("手动炼造失败：缺少包含 c_secure_pass 的思齐 Cookie")
+                return
+
+            result = await self.__execute_craft(cookie)
+            logger.info(f"手动炼造结束：{self.__craft_summary(result)}")
+
+            self._stats["last_result"] = self.__craft_summary(result)
+            try:
+                self.save_data("stats", self._stats)
+            except Exception as e:
+                logger.debug(f"保存统计数据失败：{e}")
+
+            if self._notify:
+                crafted = result.get("crafted") or []
+                pills = self.__safe_int(result.get("pills"), 0)
+                self.post_message(
+                    mtype=MessageType.Plugin,
+                    title="⚗️【思齐炼魔丸】",
+                    text=(
+                        f"⚗️ 炼造物品：{len(crafted)} 项\n"
+                        f"🧪 本次魔丸：{pills} 颗\n"
+                        f"📝 {result.get('message') or '-'}"
+                    )
+                )
+
+    async def __execute_craft(self, cookie: str) -> Dict[str, Any]:
+        """执行炼造、持久化炼造状态，有产出后刷新一次库存。"""
+        try:
+            result = await self.__craft_items(cookie)
+        except Exception as e:
+            logger.error(f"炼造异常：{e}")
+            result = {
+                "success": False,
+                "crafted": [],
+                "pills": 0,
+                "message": str(e)
+            }
+        self.__save_craft_state(result)
+        if result.get("crafted"):
+            await self.__fetch_and_update_inventory(cookie)
+        return result
+
     async def __run_brick_task(self):
         """一次性任务：手动搬砖并记录结果，与清理任务共用并发锁。"""
         lock = self.__get_lock()
@@ -868,7 +1040,7 @@ class SiQiCleanBeachV3(_PluginBase):
             if self._notify:
                 self.post_message(
                     mtype=MessageType.Plugin,
-                    title="🏖️【思齐自动收垃圾插件】",
+                    title="🏖️【思齐炼魔丸】",
                     text=(
                         f"🧱 手动搬砖：{moved} 块\n"
                         f"📅 今日累计：{daily}/{self.BRICK_MAX_DAILY}\n"
@@ -977,14 +1149,307 @@ class SiQiCleanBeachV3(_PluginBase):
             "pocket": payload.get("pocket")
         }
 
+    async def __craft_items(self, cookie: str) -> Dict[str, Any]:
+        """抓取库存与配方，规划后逐条执行炼造并返回明细。"""
+        result: Dict[str, Any] = {
+            "success": False,
+            "crafted": [],
+            "pills": 0,
+            "message": ""
+        }
+        if not cookie or "c_secure_pass=" not in cookie:
+            result["message"] = "缺少包含 c_secure_pass 的思齐 Cookie"
+            return result
+
+        try:
+            html = await self.__fetch_mowan_html(cookie)
+            if not html:
+                result["message"] = "获取炼造页面失败"
+                return result
+
+            inventory = self.__parse_inventory_html(html)
+            if not inventory:
+                result["message"] = "解析库存失败，跳过炼造"
+                logger.warning(result["message"])
+                return result
+
+            recipes = self.__parse_recipes(html)
+            if not recipes:
+                result["message"] = "解析炼造配方失败，跳过炼造"
+                logger.warning(result["message"])
+                return result
+
+            plan = self.__plan_craft(inventory, recipes, self._craft_target_pills)
+            if not plan:
+                result["success"] = True
+                result["message"] = "材料不足或无需炼造"
+                logger.info(f"炼造规划为空：{result['message']}")
+                return result
+
+            by_id = {recipe["recipe_id"]: recipe for recipe in recipes}
+            crafted: List[Dict[str, Any]] = []
+            pills = 0
+            failure = ""
+
+            for index, (recipe_id, quantity) in enumerate(plan):
+                if index:
+                    await asyncio.sleep(self.CRAFT_INTERVAL)
+                recipe = by_id.get(recipe_id) or {}
+                payload = await self.__craft_once(cookie, recipe_id, quantity)
+                if not payload.get("success"):
+                    failure = payload.get("message") or "炼造失败"
+                    logger.warning(
+                        f"炼造 {recipe.get('result_name') or recipe_id} 失败：{failure}"
+                    )
+                    break
+                produced = quantity * self.__safe_int(
+                    recipe.get("result_quantity"), 1
+                )
+                name = recipe.get("result_name") or str(recipe_id)
+                crafted.append({"name": name, "qty": produced})
+                if name == self.CRAFT_RESULT_ITEM:
+                    pills += produced
+
+            result["crafted"] = crafted
+            result["pills"] = pills
+            result["success"] = not failure
+            if failure:
+                result["message"] = failure
+            else:
+                total = sum(item.get("qty", 0) for item in crafted)
+                result["message"] = (
+                    f"炼造{len(crafted)}项共{total}件，魔丸{pills}颗"
+                )
+            logger.info(f"炼造结束：{result['message']}")
+            return result
+        except httpx2.TimeoutException:
+            logger.error("炼造请求超时")
+            result["message"] = "请求超时"
+            return result
+        except httpx2.RequestError as e:
+            logger.error(f"炼造请求失败：{e}")
+            result["message"] = str(e)
+            return result
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"炼造数据解析失败：{e}")
+            result["message"] = "返回数据解析失败"
+            return result
+
+    async def __craft_once(
+        self, cookie: str, recipe_id: int, quantity: int
+    ) -> Dict[str, Any]:
+        """请求一次 craft_item，返回是否成功与服务端消息。"""
+        payload = await self.__game_action(
+            cookie,
+            "craft_item",
+            timeout=15,
+            extra={"recipe_id": recipe_id, "quantity": quantity}
+        )
+        if self.__game_ok(payload):
+            return {"success": True, "message": payload.get("message") or ""}
+        return {"success": False, "message": payload.get("message") or "炼造失败"}
+
+    @staticmethod
+    def __parse_recipes(html: str) -> List[Dict[str, Any]]:
+        """从 mowan.php 内联 JS 的 const recipes 中解析配方表。"""
+        if not html:
+            return []
+        match = re.search(
+            r"const\s+recipes\s*=\s*(\[.*?\])\s*;", html, re.DOTALL
+        )
+        if not match:
+            return []
+        try:
+            raw = json.loads(match.group(1))
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"炼造配方 JSON 解析失败：{e}")
+            return []
+        if not isinstance(raw, list):
+            return []
+
+        recipes: List[Dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                recipe_id = int(item.get("recipe_id"))
+                result_quantity = max(1, int(item.get("result_quantity") or 1))
+            except (TypeError, ValueError):
+                continue
+            result_name = str(item.get("result_name") or "").strip()
+            ingredients: List[Dict[str, Any]] = []
+            for ingredient in item.get("ingredients") or []:
+                if not isinstance(ingredient, dict):
+                    continue
+                name = str(ingredient.get("name") or "").strip()
+                try:
+                    quantity = int(ingredient.get("quantity") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if name and quantity > 0:
+                    ingredients.append({"name": name, "quantity": quantity})
+            if not result_name or not ingredients:
+                continue
+            recipes.append({
+                "recipe_id": recipe_id,
+                "result_name": result_name,
+                "result_quantity": result_quantity,
+                "ingredients": ingredients
+            })
+        recipes.sort(key=lambda recipe: recipe["recipe_id"])
+        return recipes
+
+    @staticmethod
+    def __parse_inventory_html(html: str) -> Dict[str, Dict[str, Any]]:
+        """解析 mowan.php 页面库存网格，返回包含砖块的完整物品清单。"""
+        inventory: Dict[str, Dict[str, Any]] = {}
+        if not html:
+            return inventory
+
+        grid_match = re.search(
+            r'<div[^>]*class="[^"]*inventory-grid[^"]*"[^>]*>', html
+        )
+        segment = html[grid_match.start():] if grid_match else html
+        end_match = re.search(
+            r'<div[^>]*class="[^"]*recipe-grid[^"]*"[^>]*>', segment
+        )
+        if end_match:
+            segment = segment[:end_match.start()]
+
+        parts = re.split(
+            r'<div[^>]*class="[^"]*inventory-item[^"]*"[^>]*>', segment
+        )
+        for part in parts[1:]:
+            name_match = re.search(
+                r'<div[^>]*class="[^"]*item-name[^"]*"[^>]*>([^<]+)</div>', part
+            )
+            if not name_match:
+                continue
+            name = name_match.group(1).strip()
+            if not name or name in inventory:
+                continue
+            count_match = re.search(
+                r'<div[^>]*class="[^"]*item-count[^"]*"[^>]*>([^<]+)</div>', part
+            )
+            try:
+                count = int(count_match.group(1).strip()) if count_match else 0
+            except ValueError:
+                count = 0
+            icon_match = re.search(
+                r'<span[^>]*class="[^"]*item-icon[^"]*"[^>]*>([^<]+)</span>', part
+            )
+            inventory[name] = {
+                "name": name,
+                "count": count,
+                "icon": icon_match.group(1).strip() if icon_match else "📦"
+            }
+        return inventory
+
+    def __plan_craft(
+        self,
+        inventory: Dict[str, Any],
+        recipes: List[Dict[str, Any]],
+        target_pills: int
+    ) -> List[Tuple[int, int]]:
+        """需求驱动的递归炼造规划，只补缺口材料并返回配方升序的执行步骤。"""
+        sim: Dict[str, int] = {
+            name: self.__inventory_value(entry)
+            for name, entry in (inventory or {}).items()
+        }
+        by_result = {recipe["result_name"]: recipe for recipe in recipes}
+        plan: List[Tuple[int, int]] = []
+        steps = 0
+
+        def craftable(recipe: Dict[str, Any]) -> int:
+            caps = [
+                sim.get(ingredient["name"], 0) // max(1, ingredient["quantity"])
+                for ingredient in recipe["ingredients"]
+            ]
+            return min(caps) if caps else 0
+
+        def expand(item: str, quantity: int, depth: int) -> None:
+            nonlocal steps
+            if steps >= self.CRAFT_MAX_STEPS:
+                logger.warning(
+                    f"炼造规划步数超过上限 {self.CRAFT_MAX_STEPS}，停止展开"
+                )
+                return
+            if depth > self.CRAFT_MAX_DEPTH:
+                logger.warning(
+                    f"炼造规划递归超过深度 {self.CRAFT_MAX_DEPTH}，停止展开"
+                )
+                return
+            missing = quantity - sim.get(item, 0)
+            if missing <= 0:
+                return
+            recipe = by_result.get(item)
+            if recipe is None:
+                return
+
+            capacity = craftable(recipe)
+            if capacity < missing:
+                for ingredient in recipe["ingredients"]:
+                    expand(
+                        ingredient["name"],
+                        ingredient["quantity"] * missing,
+                        depth + 1
+                    )
+                capacity = craftable(recipe)
+
+            result_quantity = max(
+                1, self.__safe_int(recipe.get("result_quantity"), 1)
+            )
+            make = min(
+                math.ceil(missing / result_quantity),
+                capacity,
+                self.CRAFT_MAX_QUANTITY
+            )
+            if make <= 0:
+                return
+            for ingredient in recipe["ingredients"]:
+                sim[ingredient["name"]] = (
+                    sim.get(ingredient["name"], 0)
+                    - ingredient["quantity"] * make
+                )
+            sim[item] = sim.get(item, 0) + make * result_quantity
+            plan.append((recipe["recipe_id"], make))
+            steps += 1
+
+        target = min(self.CRAFT_MAX_PILLS, max(1, self.__safe_int(target_pills, 1)))
+        before_pills = sim.get(self.CRAFT_RESULT_ITEM, 0)
+        expand(self.CRAFT_RESULT_ITEM, target, 0)
+        produced_pills = sim.get(self.CRAFT_RESULT_ITEM, 0) - before_pills
+        if plan and produced_pills <= 0:
+            # 只补中间件却炼不出魔丸会白吃砖块，直接放弃本次规划
+            logger.warning("库存不足以炼出魔丸，丢弃仅含中间件的炼造规划")
+            return []
+        return plan
+
+    @staticmethod
+    def __inventory_value(entry: Any) -> int:
+        """读取库存条目数量，兼容 {'count': n} 与整数两种形式。"""
+        if isinstance(entry, dict):
+            entry = entry.get("count")
+        try:
+            return max(0, int(entry or 0))
+        except (TypeError, ValueError):
+            return 0
+
     async def __game_action(
-        self, cookie: str, action: str, timeout: int = 10
+        self,
+        cookie: str,
+        action: str,
+        timeout: int = 10,
+        extra: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """请求 mowan.php 表单接口并返回解析后的 JSON 字典。"""
+        data = {"action": action}
+        if extra:
+            data.update(extra)
         try:
             request = self.__build_client(cookie, self.__game_headers(), timeout=timeout)
             response = await request.post_res(
-                self.MOWAN_URL, data={"action": action}, raise_exception=True
+                self.MOWAN_URL, data=data, raise_exception=True
             )
             if response.status_code != 200:
                 return {"success": False, "message": f"HTTP {response.status_code}"}
@@ -1060,6 +1525,54 @@ class SiQiCleanBeachV3(_PluginBase):
             return "，搬砖失败"
         return ""
 
+    def __craft_summary(self, craft_result: Dict[str, Any]) -> str:
+        """生成炼造结果的一句话摘要。"""
+        if not craft_result:
+            return "未执行炼造"
+        pills = self.__safe_int(craft_result.get("pills"), 0)
+        crafted = craft_result.get("crafted") or []
+        total = sum(self.__safe_int(item.get("qty"), 0) for item in crafted)
+        if pills > 0:
+            return f"炼造魔丸{pills}颗"
+        if total > 0:
+            return f"炼造{total}件物品"
+        return craft_result.get("message") or "未炼造"
+
+    def __craft_suffix(self, craft_result: Dict[str, Any]) -> str:
+        """生成追加到 last_result 的炼造摘要，未炼出物品时返回空串。"""
+        if not craft_result:
+            return ""
+        pills = self.__safe_int(craft_result.get("pills"), 0)
+        if pills > 0:
+            return f"，炼造魔丸{pills}颗"
+        crafted = craft_result.get("crafted") or []
+        total = sum(self.__safe_int(item.get("qty"), 0) for item in crafted)
+        if total > 0:
+            return f"，炼造{total}件物品"
+        if not craft_result.get("success"):
+            return "，炼造失败"
+        return ""
+
+    def __save_craft_state(self, craft_result: Dict[str, Any]) -> Dict[str, Any]:
+        """合并并持久化炼造状态，可重复调用。"""
+        craft = dict(self._craft or {})
+        craft.setdefault("last_craft", [])
+        craft.setdefault("pills_total", 0)
+        craft.setdefault("last_message", "")
+        craft.setdefault("last_update", None)
+        craft["last_craft"] = list(craft_result.get("crafted") or [])
+        craft["pills_total"] = self.__safe_int(craft.get("pills_total"), 0) + max(
+            0, self.__safe_int(craft_result.get("pills"), 0)
+        )
+        craft["last_message"] = craft_result.get("message") or ""
+        craft["last_update"] = time.time()
+        self._craft = craft
+        try:
+            self.save_data("craft", craft)
+        except Exception as e:
+            logger.debug(f"保存炼造状态失败：{e}")
+        return craft
+
     def __save_brick_state(
         self,
         daily: Optional[int] = None,
@@ -1104,8 +1617,8 @@ class SiQiCleanBeachV3(_PluginBase):
                 channel=channel,
                 userid=userid,
                 mtype=MessageType.Plugin,
-                title="【思齐自动收垃圾插件】",
-                text="已有收垃圾任务正在执行，请等待当前任务结束。"
+                title="【思齐炼魔丸】",
+                text="已有任务正在执行，请等待当前任务结束。"
             )
             return
         logger.info("收到远程命令立即执行请求，提交一次性调度任务")
@@ -1113,22 +1626,22 @@ class SiQiCleanBeachV3(_PluginBase):
             self.__class__.__name__,
             "command_run_once",
             self.run_clean_task,
-            "思齐自动收垃圾命令立即运行",
+            "思齐炼魔丸命令立即运行",
             delay_seconds=1,
         )
         self.post_message(
             channel=channel,
             userid=userid,
             mtype=MessageType.Plugin,
-            title="【思齐自动收垃圾插件】",
+            title="【思齐炼魔丸】",
             text="任务已开始，完成后会发送通知。"
         )
 
     async def run_clean_task(self) -> Dict[str, Any]:
-        """执行一次清理任务：搬砖、进沙滩、收垃圾、刷新物品并通知。"""
+        """执行一次清理任务：搬砖、进沙滩、清理沙滩、刷新物品、炼造并通知。"""
         lock = self.__get_lock()
         if lock.locked():
-            return {"status": "running", "message": "已有收垃圾任务正在执行"}
+            return {"status": "running", "message": "已有清理任务正在执行"}
 
         async with lock:
             try:
@@ -1138,7 +1651,7 @@ class SiQiCleanBeachV3(_PluginBase):
                     self.__finish_task(result)
                     return result
 
-                logger.info("开始执行收垃圾任务")
+                logger.info("开始执行清理沙滩任务")
 
                 # 搬砖失败不影响后续清理流程，仅记录摘要
                 bricks_moved = 0
@@ -1195,12 +1708,30 @@ class SiQiCleanBeachV3(_PluginBase):
                 self._stats["last_update"] = time.time()
                 self._stats["total_items_count"] = total_count
 
+                craft_result: Dict[str, Any] = {}
+                if self._craft_enabled:
+                    craft_result = await self.__execute_craft(cookie)
+                    if craft_result.get("crafted"):
+                        total_count = sum(
+                            item.get("count", 0)
+                            for item in self._inventory.values()
+                        )
+                        self._stats["total_items_count"] = total_count
+                craft_suffix = self.__craft_suffix(craft_result)
+
                 if collect_success:
-                    self._stats["last_result"] = f"收集了{trash_count}个垃圾，共{total_count}个物品{brick_suffix}"
+                    self._stats["last_result"] = (
+                        f"收集了{trash_count}个垃圾，共{total_count}个物品"
+                        f"{brick_suffix}{craft_suffix}"
+                    )
                 elif "冷却" in enter_result.get("message", ""):
-                    self._stats["last_result"] = f"沙滩冷却中，共{total_count}个物品{brick_suffix}"
+                    self._stats["last_result"] = (
+                        f"沙滩冷却中，共{total_count}个物品{brick_suffix}{craft_suffix}"
+                    )
                 else:
-                    self._stats["last_result"] = f"未收集垃圾，共{total_count}个物品{brick_suffix}"
+                    self._stats["last_result"] = (
+                        f"未收集垃圾，共{total_count}个物品{brick_suffix}{craft_suffix}"
+                    )
 
                 history = self._stats.get("history", [])
                 if collect_success:
@@ -1241,14 +1772,15 @@ class SiQiCleanBeachV3(_PluginBase):
                 result["data"] = {
                     "trash": trash_count,
                     "total_count": total_count,
-                    "bricks": bricks_moved
+                    "bricks": bricks_moved,
+                    "craft": craft_result
                 }
 
                 self.__finish_task(result)
                 return result
 
             except Exception as e:
-                logger.error(f"收垃圾任务异常：{e}")
+                logger.error(f"清理沙滩任务异常：{e}")
                 import traceback
                 logger.error(traceback.format_exc())
                 try:
@@ -1395,79 +1927,12 @@ class SiQiCleanBeachV3(_PluginBase):
 
     async def __fetch_inventory(self, cookie: str) -> Optional[Dict[str, Any]]:
         """抓取并解析物品清单页面，剔除砖块。"""
+        html = await self.__fetch_mowan_html(cookie)
+        if not html:
+            return None
+
         try:
-            headers = {
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "cache-control": "max-age=0",
-                "user-agent": self.UA
-            }
-
-            logger.info("开始获取物品数据...")
-            request = self.__build_client(cookie, headers, timeout=15)
-            response = await request.get_res(
-                self.MOWAN_URL, raise_exception=True
-            )
-
-            logger.info(f"获取物品数据响应状态码：{response.status_code}")
-
-            if response.status_code != 200:
-                return None
-
-            html = response.text
-            inventory = {}
-
-            item_pattern = r'<div[^>]*class="[^"]*inventory-item[^"]*"[^>]*>(.*?)</div>\s*(?:<div|</div>|$)'
-            item_blocks = re.findall(item_pattern, html, re.DOTALL)
-
-            for item_block in item_blocks:
-                name_match = re.search(r'<div[^>]*class="[^"]*item-name[^"]*"[^>]*>([^<]+)</div>', item_block)
-                if not name_match:
-                    continue
-                name = name_match.group(1).strip()
-                
-                count_match = re.search(r'<div[^>]*class="[^"]*item-count[^"]*"[^>]*>([^<]+)</div>', item_block)
-                if not count_match:
-                    continue
-                try:
-                    count = int(count_match.group(1).strip())
-                except ValueError:
-                    count = 0
-                
-                icon_match = re.search(r'<span[^>]*class="[^"]*item-icon[^"]*"[^>]*>([^<]+)</span>', item_block)
-                icon = icon_match.group(1).strip() if icon_match else "📦"
-                
-                if name and name not in inventory:
-                    inventory[name] = {
-                        "name": name,
-                        "count": count,
-                        "icon": icon
-                    }
-
-            if len(inventory) == 0:
-                grid_match = re.search(r'<div[^>]*class="[^"]*inventory-grid[^"]*"[^>]*>(.*?)</div>\s*</div>', html, re.DOTALL)
-                if grid_match:
-                    grid_html = grid_match.group(1)
-                    parts = re.split(r'<div[^>]*class="[^"]*inventory-item[^"]*"[^>]*>', grid_html)
-                    for part in parts[1:]:
-                        name_match = re.search(r'<div[^>]*class="[^"]*item-name[^"]*"[^>]*>([^<]+)</div>', part)
-                        if not name_match:
-                            continue
-                        name = name_match.group(1).strip()
-                        
-                        count_match = re.search(r'<div[^>]*class="[^"]*item-count[^"]*"[^>]*>([^<]+)</div>', part)
-                        count = int(count_match.group(1).strip()) if count_match else 0
-                        
-                        icon_match = re.search(r'<span[^>]*class="[^"]*item-icon[^"]*"[^>]*>([^<]+)</span>', part)
-                        icon = icon_match.group(1).strip() if icon_match else "📦"
-                        
-                        if name and name not in inventory:
-                            inventory[name] = {
-                                "name": name,
-                                "count": count,
-                                "icon": icon
-                            }
-
+            inventory = self.__parse_inventory_html(html)
             if "砖块" in inventory:
                 brick_entry = inventory.pop("砖块")
                 self.__save_brick_state(
@@ -1477,15 +1942,33 @@ class SiQiCleanBeachV3(_PluginBase):
 
             logger.info(f"解析到 {len(inventory)} 种物品")
             return inventory
-
-        except httpx2.TimeoutException:
-            logger.error("获取物品数据请求超时")
-            return None
-        except httpx2.RequestError as e:
-            logger.error(f"获取物品数据请求失败：{e}")
-            return None
         except Exception as e:
             logger.error(f"获取物品数据异常：{e}")
+            return None
+
+    async def __fetch_mowan_html(self, cookie: str) -> Optional[str]:
+        """抓取 mowan.php 页面 HTML（包含库存网格与炼造配方）。"""
+        headers = {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "cache-control": "max-age=0",
+            "user-agent": self.UA
+        }
+        try:
+            logger.info("开始获取页面数据...")
+            request = self.__build_client(cookie, headers, timeout=15)
+            response = await request.get_res(
+                self.MOWAN_URL, raise_exception=True
+            )
+            logger.info(f"获取页面数据响应状态码：{response.status_code}")
+            if response.status_code != 200:
+                return None
+            return response.text
+        except httpx2.TimeoutException:
+            logger.error("获取页面数据请求超时")
+            return None
+        except httpx2.RequestError as e:
+            logger.error(f"获取页面数据请求失败：{e}")
             return None
 
     def __build_client(
@@ -1567,7 +2050,7 @@ class SiQiCleanBeachV3(_PluginBase):
             logger.error(f"更新统计数据失败：{e}")
 
     def __send_notification(self, result: Dict[str, Any]):
-        title = "🏖️【思齐自动收垃圾插件】"
+        title = "🏖️【思齐炼魔丸】"
         status_map = {
             "completed": "✅ 成功",
             "partial": "⚠️ 部分成功",
@@ -1586,6 +2069,10 @@ class SiQiCleanBeachV3(_PluginBase):
                 text += f"\n📦 当前物品总数：{data['total_count']:,} 个"
             if data.get("bricks"):
                 text += f"\n\n🧱 搬砖：{data['bricks']} 块"
+            craft = data.get("craft") or {}
+            pills = self.__safe_int(craft.get("pills"), 0)
+            if pills > 0:
+                text += f"\n⚗️ 炼造魔丸：{pills} 颗"
 
         total_count = sum(item.get("count", 0) for item in self._inventory.values())
         text += f"\n\n📊 物品种类：{len(self._inventory)} 种"

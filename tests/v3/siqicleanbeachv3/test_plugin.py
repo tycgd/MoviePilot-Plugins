@@ -62,6 +62,7 @@ class ActionRequestUtils:
     """按 action 分发预置响应的假客户端，供搬砖与清理流程使用。"""
 
     actions: list = []
+    bodies: list = []
     responses: dict = {}
     inventory_html: str = ""
 
@@ -71,12 +72,15 @@ class ActionRequestUtils:
     @classmethod
     def reset(cls, responses=None, inventory_html: str = "") -> None:
         cls.actions = []
+        cls.bodies = []
         cls.responses = dict(responses or {})
         cls.inventory_html = inventory_html
 
     async def post_res(self, url, **kwargs):
-        action = (kwargs.get("data") or {}).get("action", "")
+        data = kwargs.get("data") or {}
+        action = data.get("action", "")
         ActionRequestUtils.actions.append(action)
+        ActionRequestUtils.bodies.append(dict(data))
         queued = ActionRequestUtils.responses.get(action)
         if queued is None:
             return FakeResponse(payload={"success": True})
@@ -102,6 +106,8 @@ def build_plugin(module):
     plugin._lock = None
     plugin._brick_enabled = True
     plugin._brick_max_per_run = 50
+    plugin._craft_enabled = True
+    plugin._craft_target_pills = 1
     plugin._bricks = {
         "daily": 0,
         "pocket": 0,
@@ -115,6 +121,12 @@ def build_plugin(module):
         "last_result": "",
         "total_items_count": 0,
         "history": [],
+    }
+    plugin._craft = {
+        "last_craft": [],
+        "pills_total": 0,
+        "last_message": "",
+        "last_update": None,
     }
     plugin._data = {}
     plugin.save_data = lambda key, value: plugin._data.__setitem__(key, value)
@@ -131,7 +143,7 @@ def test_metadata_matches_directory():
     cls = module.SiQiCleanBeachV3
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqicleanbeachv3"
-    assert cls.plugin_version == "1.1.0"
+    assert cls.plugin_version == "1.2.0"
     assert cls.plugin_config_prefix == "siqicleanbeachv3_"
 
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
@@ -165,6 +177,7 @@ def test_contract_methods_present():
     assert asyncio.iscoroutinefunction(cls.run_once_api)
     assert asyncio.iscoroutinefunction(cls.run_once_command)
     assert asyncio.iscoroutinefunction(cls.move_bricks_api)
+    assert asyncio.iscoroutinefunction(cls.craft_api)
 
 
 def test_cookie_parse_and_safe_int():
@@ -307,7 +320,13 @@ def test_stop_service_removes_all_once_jobs(monkeypatch):
     plugin.stop_service()
     plugin.stop_service()
 
-    expected = ["run_once", "api_run_once", "command_run_once", "brick_run_once"]
+    expected = [
+        "run_once",
+        "api_run_once",
+        "command_run_once",
+        "brick_run_once",
+        "craft_run_once",
+    ]
     assert removed == expected + expected
 
 
@@ -563,6 +582,377 @@ def test_move_bricks_api_schedules_once_job(monkeypatch):
     assert result["success"] is True
     assert len(scheduled) == 2
     assert scheduled[1][0][1] == "brick_run_once"
+
+
+CRAFT_RECIPES_JS = """const recipes = [
+    {"0":"1","recipe_id":"1","result_quantity":"1","result_name":"木工件","ingredients":[
+        {"recipe_id":"1","quantity":"5","name":"砖块"},
+        {"recipe_id":"1","quantity":"1","name":"木材"},
+        {"recipe_id":"1","quantity":"1","name":"塑料袋"}]},
+    {"0":"2","recipe_id":"2","result_quantity":"1","result_name":"塑料件","ingredients":[
+        {"recipe_id":"2","quantity":"5","name":"砖块"},
+        {"recipe_id":"2","quantity":"1","name":"塑料袋"},
+        {"recipe_id":"2","quantity":"1","name":"瓶子"}]},
+    {"0":"3","recipe_id":"3","result_quantity":"1","result_name":"简易工具","ingredients":[
+        {"recipe_id":"3","quantity":"2","name":"螺丝"},
+        {"recipe_id":"3","quantity":"2","name":"木工件"}]},
+    {"0":"4","recipe_id":"4","result_quantity":"1","result_name":"能量碎片","ingredients":[
+        {"recipe_id":"4","quantity":"1","name":"旧电池"},
+        {"recipe_id":"4","quantity":"2","name":"塑料件"}]},
+    {"0":"5","recipe_id":"5","result_quantity":"1","result_name":"魔丸胚胎","ingredients":[
+        {"recipe_id":"5","quantity":"1","name":"破铜片"},
+        {"recipe_id":"5","quantity":"1","name":"简易工具"},
+        {"recipe_id":"5","quantity":"1","name":"能量碎片"}]},
+    {"0":"6","recipe_id":"6","result_quantity":"1","result_name":"魔丸","ingredients":[
+        {"recipe_id":"6","quantity":"10","name":"砖块"},
+        {"recipe_id":"6","quantity":"2","name":"魔丸胚胎"}]}
+];"""
+
+
+def _rich_inventory() -> dict:
+    """构造刚好够炼出 1 颗魔丸的库存。"""
+    return {
+        "砖块": 50,
+        "木材": 4,
+        "塑料袋": 8,
+        "瓶子": 4,
+        "螺丝": 4,
+        "旧电池": 2,
+        "破铜片": 2,
+        "木工件": 0,
+        "塑料件": 0,
+        "简易工具": 0,
+        "能量碎片": 0,
+        "魔丸胚胎": 0,
+        "魔丸": 0,
+    }
+
+
+def _inventory_page(counts: dict, recipes_js: str = CRAFT_RECIPES_JS) -> str:
+    """拼装包含库存网格与炼造配方的 mowan.php 页面。"""
+    items = "".join(
+        f'<div class="inventory-item"><span class="item-icon">x</span>'
+        f'<div class="item-name">{name}</div>'
+        f'<div class="item-count">{count}</div></div>'
+        for name, count in counts.items()
+    )
+    return (
+        f'<div class="inventory-grid">{items}</div>'
+        f'<div class="recipe-grid"></div><script>{recipes_js}</script>'
+    )
+
+
+def test_parse_recipes_from_inline_js():
+    """内联 JS 中 const recipes 可解析出 6 条配方且材料正确。"""
+    module = load_plugin_module()
+    parse = module.SiQiCleanBeachV3._SiQiCleanBeachV3__parse_recipes
+
+    recipes = parse(CRAFT_RECIPES_JS)
+
+    assert [recipe["recipe_id"] for recipe in recipes] == [1, 2, 3, 4, 5, 6]
+    assert [recipe["result_name"] for recipe in recipes] == [
+        "木工件", "塑料件", "简易工具", "能量碎片", "魔丸胚胎", "魔丸"
+    ]
+    assert recipes[0]["ingredients"] == [
+        {"name": "砖块", "quantity": 5},
+        {"name": "木材", "quantity": 1},
+        {"name": "塑料袋", "quantity": 1},
+    ]
+    assert recipes[4]["ingredients"] == [
+        {"name": "破铜片", "quantity": 1},
+        {"name": "简易工具", "quantity": 1},
+        {"name": "能量碎片", "quantity": 1},
+    ]
+    assert recipes[5]["result_quantity"] == 1
+    assert parse("<html></html>") == []
+    assert parse("const recipes = [broken;") == []
+
+
+def test_plan_craft_uses_bricks_exactly():
+    """库存充足时按材料到成品顺序规划，砖块恰好用掉 50。"""
+    module = load_plugin_module()
+    parse = module.SiQiCleanBeachV3._SiQiCleanBeachV3__parse_recipes
+    planner = module.SiQiCleanBeachV3._SiQiCleanBeachV3__plan_craft
+
+    recipes = parse(CRAFT_RECIPES_JS)
+    inventory = _rich_inventory()
+    plan = planner(object.__new__(module.SiQiCleanBeachV3), inventory, recipes, 1)
+
+    assert [recipe_id for recipe_id, _ in plan] == [1, 3, 2, 4, 5, 6]
+    assert plan == [(1, 4), (3, 2), (2, 4), (4, 2), (5, 2), (6, 1)]
+
+    by_id = {recipe["recipe_id"]: recipe for recipe in recipes}
+    positions = {recipe_id: index for index, (recipe_id, _) in enumerate(plan)}
+    for index, (recipe_id, _) in enumerate(plan):
+        for ingredient in by_id[recipe_id]["ingredients"]:
+            producer = next(
+                (
+                    recipe["recipe_id"]
+                    for recipe in recipes
+                    if recipe["result_name"] == ingredient["name"]
+                ),
+                None,
+            )
+            if producer in positions:
+                assert positions[producer] < index
+
+    sim = dict(inventory)
+    for recipe_id, make in plan:
+        recipe = by_id[recipe_id]
+        for ingredient in recipe["ingredients"]:
+            sim[ingredient["name"]] -= ingredient["quantity"] * make
+        sim[recipe["result_name"]] += make * recipe["result_quantity"]
+
+    assert sim["魔丸"] == 1
+    assert sim["砖块"] == 0
+
+
+def test_craft_skips_when_bricks_insufficient(monkeypatch):
+    """砖块只有 1 块时规划为空，不发送任何 craft_item。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
+    monkeypatch.setattr(module.SiQiCleanBeachV3, "CRAFT_INTERVAL", 0)
+
+    inventory = _rich_inventory()
+    inventory["砖块"] = 1
+    ActionRequestUtils.reset(inventory_html=_inventory_page(inventory))
+
+    plugin = build_plugin(module)
+    craft = module.SiQiCleanBeachV3._SiQiCleanBeachV3__craft_items
+
+    result = asyncio.run(craft(plugin, "c_secure_pass=token"))
+
+    assert result["crafted"] == []
+    assert "craft_item" not in ActionRequestUtils.actions
+
+
+def test_plan_craft_drops_wasteful_intermediates(monkeypatch):
+    """砖块不足以炼出魔丸时丢弃中间件规划，避免白吃砖块。"""
+    module = load_plugin_module()
+    parse = module.SiQiCleanBeachV3._SiQiCleanBeachV3__parse_recipes
+    planner = module.SiQiCleanBeachV3._SiQiCleanBeachV3__plan_craft
+
+    inventory = _rich_inventory()
+    inventory["砖块"] = 31
+    plan = planner(
+        object.__new__(module.SiQiCleanBeachV3),
+        inventory,
+        parse(CRAFT_RECIPES_JS),
+        1,
+    )
+
+    assert plan == []
+
+
+def test_plan_craft_reuses_existing_intermediates():
+    """已有中间件时只补缺口，仅规划胚胎与魔丸。"""
+    module = load_plugin_module()
+    parse = module.SiQiCleanBeachV3._SiQiCleanBeachV3__parse_recipes
+    planner = module.SiQiCleanBeachV3._SiQiCleanBeachV3__plan_craft
+
+    inventory = {
+        "砖块": 10,
+        "破铜片": 2,
+        "简易工具": 2,
+        "能量碎片": 2,
+        "魔丸胚胎": 0,
+        "魔丸": 0,
+    }
+    plan = planner(
+        object.__new__(module.SiQiCleanBeachV3),
+        inventory,
+        parse(CRAFT_RECIPES_JS),
+        1,
+    )
+
+    assert plan == [(5, 2), (6, 1)]
+
+
+def test_craft_stops_on_midway_failure(monkeypatch):
+    """第 2 条 craft_item 失败后停止，保留已成功条目与失败消息。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
+    monkeypatch.setattr(module.SiQiCleanBeachV3, "CRAFT_INTERVAL", 0)
+    ActionRequestUtils.reset(
+        {
+            "craft_item": [
+                FakeResponse(payload={"success": True, "message": "炼造成功"}),
+                FakeResponse(payload={"success": False, "message": "材料不足"}),
+            ]
+        },
+        inventory_html=_inventory_page(_rich_inventory()),
+    )
+
+    plugin = build_plugin(module)
+    craft = module.SiQiCleanBeachV3._SiQiCleanBeachV3__craft_items
+
+    result = asyncio.run(craft(plugin, "c_secure_pass=token"))
+
+    assert ActionRequestUtils.actions.count("craft_item") == 2
+    assert ActionRequestUtils.bodies[0]["recipe_id"] == 1
+    assert ActionRequestUtils.bodies[0]["quantity"] == 4
+    assert ActionRequestUtils.bodies[1]["recipe_id"] == 3
+    assert result["success"] is False
+    assert result["crafted"] == [{"name": "木工件", "qty": 4}]
+    assert result["message"] == "材料不足"
+
+
+def test_craft_disabled_skips_in_clean_task(monkeypatch):
+    """craft_enabled=False 时清理任务完全不触发炼造。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
+    ActionRequestUtils.reset(
+        {
+            "enter_beach": FakeResponse(payload={"success": True}),
+            "collect_all_trash": FakeResponse(
+                payload={"success": True, "data": {"collected": 2}}
+            ),
+        },
+        inventory_html=_inventory_page(_rich_inventory()),
+    )
+
+    plugin = build_plugin(module)
+    plugin._cookie = "c_secure_pass=token"
+    plugin._craft_enabled = False
+
+    result = asyncio.run(plugin.run_clean_task())
+
+    assert "craft_item" not in ActionRequestUtils.actions
+    assert result["status"] == "completed"
+    assert result["data"]["craft"] == {}
+
+
+def test_rename_and_version_consistency():
+    """显示名改为思齐炼魔丸，两处版本与 history 顶部保持一致。"""
+    module = load_plugin_module()
+    cls = module.SiQiCleanBeachV3
+    package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
+    entry = package[cls.__name__]
+
+    assert cls.plugin_name == "思齐炼魔丸"
+    assert cls.plugin_version == "1.2.0"
+    assert entry["version"] == "1.2.0"
+    assert entry["name"] == "思齐炼魔丸"
+    assert "炼造" in entry["description"]
+    assert next(iter(entry["history"])) == "v1.2.0"
+    assert "炼造" in entry["history"]["v1.2.0"]
+    assert "更名" in entry["history"]["v1.2.0"]
+
+
+def test_get_page_shows_craft_cards():
+    """详情页在搬砖卡片旁展示魔丸与魔丸胚胎数量。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._inventory = {
+        "魔丸": {"name": "魔丸", "count": 4, "icon": "⚗️"},
+        "魔丸胚胎": {"name": "魔丸胚胎", "count": 2, "icon": "🥚"},
+    }
+
+    page_text = json.dumps(plugin.get_page(), ensure_ascii=False)
+
+    assert "魔丸" in page_text
+    assert "4颗" in page_text
+    assert "魔丸胚胎" in page_text
+    assert "2个" in page_text
+
+
+def test_run_clean_task_crafts_after_collect(monkeypatch):
+    """清理任务在收集与刷新后执行炼造，并持久化炼造状态。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
+    monkeypatch.setattr(module.SiQiCleanBeachV3, "CRAFT_INTERVAL", 0)
+    ActionRequestUtils.reset(
+        {
+            "enter_beach": FakeResponse(payload={"success": True}),
+            "collect_all_trash": FakeResponse(
+                payload={"success": True, "data": {"collected": 3}}
+            ),
+        },
+        inventory_html=_inventory_page(_rich_inventory()),
+    )
+
+    plugin = build_plugin(module)
+    plugin._cookie = "c_secure_pass=token"
+
+    result = asyncio.run(plugin.run_clean_task())
+
+    assert result["status"] == "completed"
+    assert result["data"]["craft"]["pills"] == 1
+    assert result["data"]["craft"]["success"] is True
+    assert ActionRequestUtils.actions.index("enter_beach") < ActionRequestUtils.actions.index(
+        "craft_item"
+    )
+    assert "炼造魔丸1颗" in plugin._stats["last_result"]
+    assert plugin._data["craft"]["pills_total"] == 1
+    assert plugin._data["craft"]["last_craft"][-1] == {"name": "魔丸", "qty": 1}
+    assert plugin._data["craft"]["last_update"]
+
+
+def test_craft_api_schedules_once_job(monkeypatch):
+    """/craft 提交一次性任务，且停用时会遍历到 craft_run_once。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    scheduled = []
+    monkeypatch.setattr(
+        module.scheduler_sdk,
+        "add_plugin_once_job",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)),
+    )
+
+    result = asyncio.run(plugin.craft_api())
+
+    assert result["success"] is True
+    assert scheduled and scheduled[0][0][1] == "craft_run_once"
+    assert "craft_run_once" in module.SiQiCleanBeachV3.ONCE_JOB_IDS
+    assert "/craft" in [api["path"] for api in plugin.get_api()]
+
+
+def test_craft_skips_when_recipes_unparsable(monkeypatch):
+    """配方解析失败时降级跳过炼造，不抛异常也不发请求。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
+    ActionRequestUtils.reset(
+        inventory_html=_inventory_page(_rich_inventory(), "const recipes = [;")
+    )
+
+    plugin = build_plugin(module)
+    craft = module.SiQiCleanBeachV3._SiQiCleanBeachV3__craft_items
+
+    result = asyncio.run(craft(plugin, "c_secure_pass=token"))
+
+    assert result["success"] is False
+    assert "配方" in result["message"]
+    assert "craft_item" not in ActionRequestUtils.actions
+
+
+def test_notification_mentions_crafted_pills():
+    """通知文本在 data.craft.pills 大于 0 时追加炼造行。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    sent = {}
+    plugin.post_message = lambda **kwargs: sent.update(kwargs)
+    notify = module.SiQiCleanBeachV3._SiQiCleanBeachV3__send_notification
+
+    notify(
+        plugin,
+        {
+            "status": "completed",
+            "message": "ok",
+            "data": {"craft": {"pills": 2}},
+        },
+    )
+    assert "⚗️ 炼造魔丸：2 颗" in sent["text"]
+
+    sent.clear()
+    notify(
+        plugin,
+        {
+            "status": "completed",
+            "message": "ok",
+            "data": {"craft": {"pills": 0}},
+        },
+    )
+    assert "炼造魔丸" not in sent["text"]
 
 
 class _MiniMonkeyPatch:
