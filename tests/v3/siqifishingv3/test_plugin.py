@@ -344,7 +344,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.1.0"
+    assert cls.plugin_version == "1.1.1"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -416,7 +416,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.1.0"
+    assert cls.plugin_version == "1.1.1"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -985,6 +985,96 @@ def test_api_status_wraps_data():
     assert set(result["data"]) == {"daily", "state"}
 
 
+def test_api_status_envelope():
+    """状态接口外壳恰好三键，daily/state 收进 data。"""
+    plugin = build_plugin(load_plugin_module())
+
+    result = asyncio.run(plugin.api_status())
+
+    assert set(result) == {"success", "message", "data"}
+    assert isinstance(result["message"], str)
+    assert result["success"] is True
+    assert result["data"]["daily"] is plugin._daily
+    assert result["data"]["state"] is plugin._state
+
+
+def test_api_responses_are_envelopes(monkeypatch):
+    """get_api 暴露的 6 个端点都返回 success/message/data 三键外壳。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    monkeypatch.setattr(
+        module.scheduler_sdk, "add_plugin_once_job", lambda *a, **k: None
+    )
+    ActionRequestUtils.reset(html=fishing_html(make_data()))
+    plugin = build_plugin(module)
+    payloads = {
+        "/run": None,
+        "/status": None,
+        "/fish_now": {"casts": 1},
+        "/sync": None,
+        "/set_option": {"key": "dry_run", "value": True},
+        "/deliver": None,
+    }
+
+    apis = plugin.get_api()
+    assert len(apis) == 6
+    for api in apis:
+        plugin._lock = None
+        payload = payloads[api["path"]]
+        if payload is None:
+            response = asyncio.run(api["endpoint"]())
+        else:
+            response = asyncio.run(api["endpoint"](payload))
+        assert set(response) == {"success", "message", "data"}, api["path"]
+        assert isinstance(response["message"], str), api["path"]
+        assert isinstance(response["data"], dict), api["path"]
+
+
+def test_fish_now_locked_envelope():
+    """快捷抛竿遇到锁时返回三键，并带 running 状态。"""
+    plugin = build_plugin(load_plugin_module())
+    plugin._lock = SimpleNamespace(locked=lambda: True)
+
+    result = asyncio.run(plugin.api_fish_now({"casts": 1}))
+
+    assert set(result) == {"success", "message", "data"}
+    assert result["success"] is False
+    assert result["data"]["status"] == "running"
+    assert isinstance(result["message"], str)
+
+
+def test_run_api_envelope(monkeypatch):
+    """立即运行接口返回三键外壳。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(
+        module.scheduler_sdk, "add_plugin_once_job", lambda *a, **k: None
+    )
+    plugin = build_plugin(module)
+
+    result = asyncio.run(plugin.run_once_api())
+
+    assert set(result) == {"success", "message", "data"}
+    assert result["success"] is True
+    assert isinstance(result["message"], str)
+    assert isinstance(result["data"], dict)
+
+
+def test_api_response_helper_normalizes():
+    """统一外壳辅助函数把 None 与非 dict data 归一。"""
+    module = load_plugin_module()
+    helper = getattr(module.SiQiFishingV3, "_SiQiFishingV3__api_response")
+
+    empty = helper(True, None, None)
+    assert empty == {"success": True, "message": "", "data": {}}
+
+    wrapped = helper(True, "x", [1, 2])
+    assert set(wrapped) == {"success", "message", "data"}
+    assert wrapped["message"] == "x"
+    assert isinstance(wrapped["data"], dict)
+    assert wrapped["data"] == {"value": [1, 2]}
+
+
 def test_non_json_response_marks_failed(monkeypatch):
     """抛竿返回非 JSON 时按失败处理并停止。"""
     _, result = _run_task(
@@ -1508,7 +1598,9 @@ def test_fish_now_returns_running_when_locked(monkeypatch):
 
     result = asyncio.run(plugin.api_fish_now({"casts": 1}))
 
-    assert result.get("status") == "running", result
+    assert set(result) == {"success", "message", "data"}, result
+    assert result["success"] is False
+    assert result["data"].get("status") == "running", result
     assert ActionRequestUtils.calls == []
 
 
@@ -1587,7 +1679,9 @@ def test_sync_locked_returns_running(monkeypatch):
 
     result = asyncio.run(plugin.api_sync())
 
-    assert result.get("status") == "running", result
+    assert set(result) == {"success", "message", "data"}, result
+    assert result["success"] is False
+    assert result["data"].get("status") == "running", result
     assert ActionRequestUtils.calls == []
 
 

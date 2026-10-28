@@ -26,7 +26,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -347,7 +347,7 @@ class SiQiFishingV3(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "页面快捷抛竿",
-                "description": "同步钓 1~3 竿，不补饵、不竞猜、不交付任务",
+                "description": "同步执行，响应为三键外壳；同步钓 1~3 竿，不补饵、不竞猜、不交付任务",
             },
             {
                 "path": "/sync",
@@ -1886,7 +1886,9 @@ class SiQiFishingV3(_PluginBase):
     async def run_once_api(self) -> Dict[str, Any]:
         """API：提交一次后台钓鱼任务，不阻塞请求。"""
         if self.__get_lock().locked():
-            return {"success": False, "message": "已有钓鱼任务正在执行"}
+            return self.__api_response(
+                False, "已有钓鱼任务正在执行", {"status": "running"}
+            )
         scheduler_sdk.add_plugin_once_job(
             self.__class__.__name__,
             "api_run_once",
@@ -1894,16 +1896,20 @@ class SiQiFishingV3(_PluginBase):
             "思齐钓鱼API立即运行",
             delay_seconds=1,
         )
-        return {"success": True, "message": "任务已提交，完成后会发送通知"}
+        return self.__api_response(True, "任务已提交，完成后会发送通知")
 
     async def api_status(self) -> Dict[str, Any]:
         """API：返回今日统计与运行态快照。"""
-        return {"success": True, "data": {"daily": self._daily, "state": self._state}}
+        return self.__api_response(
+            True,
+            "已获取状态",
+            {"daily": self._daily, "state": self._state},
+        )
 
     async def api_fish_now(
         self, payload: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """API：页面快捷钓 1~3 竿，不补饵、不竞猜、不交付任务。"""
+        """API：页面快捷钓 1~3 竿；同步执行，响应为三键外壳（success/message/data）。"""
         payload = payload if isinstance(payload, dict) else {}
         limit = min(
             self.MAX_QUICK_CASTS,
@@ -1913,11 +1919,11 @@ class SiQiFishingV3(_PluginBase):
         lock = self.__get_lock()
         if lock.locked():
             logger.warning("思齐钓鱼：快捷抛竿被跳过，已有任务执行中")
-            return {
-                "success": False,
-                "status": "running",
-                "message": "已有钓鱼任务正在执行，请稍后再试",
-            }
+            return self.__api_response(
+                False,
+                "已有钓鱼任务正在执行，请稍后再试",
+                {"status": "running"},
+            )
 
         async with lock:
             result = self.__new_result()
@@ -1947,56 +1953,58 @@ class SiQiFishingV3(_PluginBase):
 
             self.__finish_task(result)
 
-        response = dict(result)
-        response["success"] = result.get("status") == "completed"
-        return response
+        status = str(result.get("status") or "")
+        data = result.get("data")
+        data = dict(data) if isinstance(data, dict) else {}
+        data["status"] = status
+        data["timestamp"] = result.get("timestamp")
+        return self.__api_response(status == "completed", result.get("message"), data)
 
     async def api_sync(self) -> Dict[str, Any]:
         """API：只同步站点状态，绝不调用任何 action 接口。"""
         lock = self.__get_lock()
         if lock.locked():
-            return {
-                "success": False,
-                "status": "running",
-                "message": "已有钓鱼任务正在执行，请稍后再试",
-            }
+            return self.__api_response(
+                False,
+                "已有钓鱼任务正在执行，请稍后再试",
+                {"status": "running"},
+            )
 
         async with lock:
             try:
                 cookie = self._cookie or await self.__get_site_cookie_async()
                 if not cookie or "c_secure_pass=" not in cookie:
-                    return {
-                        "success": False,
-                        "message": "缺少包含 c_secure_pass 的思齐 Cookie，请检查配置或站点管理",
-                    }
+                    return self.__api_response(
+                        False,
+                        "缺少包含 c_secure_pass 的思齐 Cookie，请检查配置或站点管理",
+                    )
                 self._daily = self.__roll_daily(
                     self._daily, datetime.now(self.TZ_CN).strftime("%Y-%m-%d")
                 )
                 client = self.__build_client(cookie, self.__game_headers(), 20)
                 data = self.__parse_state(await self.__fetch_page(client))
                 if not data:
-                    return {
-                        "success": False,
-                        "message": "无法读取钓鱼页面，请检查 Cookie 是否失效",
-                    }
+                    return self.__api_response(
+                        False, "无法读取钓鱼页面，请检查 Cookie 是否失效"
+                    )
                 self.__apply_state(data)
                 self.__record("sync", "手动同步状态")
                 self.__save_state()
             except httpx2.TimeoutException:
                 logger.error("思齐钓鱼：同步状态请求超时")
-                return {"success": False, "message": "请求超时"}
+                return self.__api_response(False, "请求超时")
             except httpx2.RequestError as e:
                 logger.error(f"思齐钓鱼：同步状态请求异常：{e}")
-                return {"success": False, "message": f"请求异常：{e}"}
+                return self.__api_response(False, f"请求异常：{e}")
             except Exception as e:
                 logger.error(f"思齐钓鱼：同步状态执行异常：{e}")
-                return {"success": False, "message": f"同步失败：{e}"}
+                return self.__api_response(False, f"同步失败：{e}")
 
         state = self._state or {}
-        return {
-            "success": True,
-            "message": "已同步状态",
-            "data": {
+        return self.__api_response(
+            True,
+            "已同步状态",
+            {
                 "attempts_used": state.get("attempts_used"),
                 "attempts_limit": state.get("attempts_limit"),
                 "catches": state.get("catches"),
@@ -2004,7 +2012,7 @@ class SiQiFishingV3(_PluginBase):
                 "tasks_ready": state.get("tasks_ready"),
                 "updated_at": state.get("updated_at"),
             },
-        }
+        )
 
     async def api_set_option(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """API：页面修改白名单选项，整体回写配置并同步内存属性。"""
@@ -2014,20 +2022,16 @@ class SiQiFishingV3(_PluginBase):
         ok, normalized, label = self.__normalize_option(key, value)
         if not ok:
             logger.warning(f"思齐钓鱼：页面修改选项被拒绝：{label}")
-            return {"success": False, "message": label, "data": {"key": key}}
+            return self.__api_response(False, label, {"key": key})
 
         if key == "rod_fixed" and not self.__rod_unlocked(normalized["rod_key"]):
-            return {"success": False, "message": "鱼竿未解锁", "data": {"key": key}}
+            return self.__api_response(False, "鱼竿未解锁", {"key": key})
 
         try:
             config = dict(self.get_config() or {})
         except Exception as e:
             logger.error(f"思齐钓鱼：读取配置失败，未保存：{e}")
-            return {
-                "success": False,
-                "message": "读取配置失败，未保存",
-                "data": {"key": key},
-            }
+            return self.__api_response(False, "读取配置失败，未保存", {"key": key})
         updates = (
             dict(normalized) if isinstance(normalized, dict) else {key: normalized}
         )
@@ -2036,72 +2040,63 @@ class SiQiFishingV3(_PluginBase):
             self.update_config(config)
         except Exception as e:
             logger.error(f"思齐钓鱼：保存选项失败：{e}")
-            return {
-                "success": False,
-                "message": f"保存失败：{e}",
-                "data": {"key": key},
-            }
+            return self.__api_response(False, f"保存失败：{e}", {"key": key})
 
         for field, field_value in updates.items():
             setattr(self, f"_{field}", field_value)
         logger.info(f"思齐钓鱼：页面已更新{label}")
-        return {
-            "success": True,
-            "message": f"已更新{label}",
-            "data": {"key": key, "value": normalized},
-        }
+        return self.__api_response(
+            True, f"已更新{label}", {"key": key, "value": normalized}
+        )
 
     async def api_deliver(self) -> Dict[str, Any]:
         """API：刷新状态后仅交付 progress.ready 的任务。"""
         lock = self.__get_lock()
         if lock.locked():
-            return {
-                "success": False,
-                "status": "running",
-                "message": "已有钓鱼任务正在执行，请稍后再试",
-            }
+            return self.__api_response(
+                False,
+                "已有钓鱼任务正在执行，请稍后再试",
+                {"status": "running"},
+            )
 
         async with lock:
             try:
                 cookie = self._cookie or await self.__get_site_cookie_async()
                 if not cookie or "c_secure_pass=" not in cookie:
-                    return {
-                        "success": False,
-                        "message": "缺少包含 c_secure_pass 的思齐 Cookie，请检查配置或站点管理",
-                    }
+                    return self.__api_response(
+                        False,
+                        "缺少包含 c_secure_pass 的思齐 Cookie，请检查配置或站点管理",
+                    )
                 self._daily = self.__roll_daily(
                     self._daily, datetime.now(self.TZ_CN).strftime("%Y-%m-%d")
                 )
                 client = self.__build_client(cookie, self.__game_headers(), 20)
                 data = self.__parse_state(await self.__fetch_page(client))
                 if not data:
-                    return {
-                        "success": False,
-                        "message": "无法读取钓鱼页面，请检查 Cookie 是否失效",
-                    }
+                    return self.__api_response(
+                        False, "无法读取钓鱼页面，请检查 Cookie 是否失效"
+                    )
                 self.__apply_state(data)
                 ready = self.__safe_int(self._state.get("tasks_ready"), 0)
                 if ready <= 0:
                     self.__save_state()
-                    return {
-                        "success": True,
-                        "data": {"delivered": 0},
-                        "message": "当前没有可交付的任务",
-                    }
+                    return self.__api_response(
+                        True, "当前没有可交付的任务", {"delivered": 0}
+                    )
                 delivered = await self.__deliver_tasks(client)
                 self.__save_state()
             except httpx2.TimeoutException:
                 logger.error("思齐钓鱼：交付任务请求超时")
-                return {"success": False, "message": "请求超时"}
+                return self.__api_response(False, "请求超时")
             except httpx2.RequestError as e:
                 logger.error(f"思齐钓鱼：交付任务请求异常：{e}")
-                return {"success": False, "message": f"请求异常：{e}"}
+                return self.__api_response(False, f"请求异常：{e}")
             except Exception as e:
                 logger.error(f"思齐钓鱼：交付任务执行异常：{e}")
-                return {"success": False, "message": f"交付失败：{e}"}
+                return self.__api_response(False, f"交付失败：{e}")
 
         message = f"已交付 {delivered} 个任务" if delivered else "任务交付未成功"
-        return {"success": True, "data": {"delivered": delivered}, "message": message}
+        return self.__api_response(True, message, {"delivered": delivered})
 
     async def run_fishing_task(self, **kwargs) -> Dict[str, Any]:
         """执行一次任务：同步状态、补饵、选饵选竿、抛竿、交付任务。"""
@@ -2862,6 +2857,20 @@ class SiQiFishingV3(_PluginBase):
         except (ValueError, TypeError):
             result = default
         return min(max_value, max(min_value, result))
+
+    @staticmethod
+    def __api_response(
+        success: bool, message: Any, data: Any = None
+    ) -> Dict[str, Any]:
+        """构造前端要求的响应外壳：恰好 success/message/data 三键。"""
+        text = "" if message is None else str(message)
+        if isinstance(data, dict):
+            payload = dict(data)
+        elif data is None:
+            payload = {}
+        else:
+            payload = {"value": data}
+        return {"success": bool(success), "message": text, "data": payload}
 
     @staticmethod
     def __new_result(status: str = "running", message: str = "") -> Dict[str, Any]:
