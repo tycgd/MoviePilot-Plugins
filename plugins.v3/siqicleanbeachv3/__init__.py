@@ -26,7 +26,7 @@ class SiQiCleanBeachV3(_PluginBase):
     plugin_name = "思齐炼魔丸"
     plugin_desc = "自动搬砖、清理沙滩并炼造魔丸，支持定时与手动触发。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqicleanbeachv3_"
@@ -720,86 +720,102 @@ class SiQiCleanBeachV3(_PluginBase):
         last_update: str,
         last_result: str,
     ) -> Dict[str, Any]:
-        """生成顶部渐变 Hero 卡片：魔丸库存、状态、定时与上次执行摘要。"""
+        """生成顶部渐变 Hero 区块。
+
+        背景统一交给原生 div 的 inline style：Vuetify 卡片会用主题色覆盖容器背景，
+        把渐变挂在 VCard 上会导致白字压白底、整块看起来是空白。
+        """
         status_text = "⚡ 已启用" if self._enabled else "💤 已停用"
+        status_bg = "rgba(255, 255, 255, 0.22)" if self._enabled else "rgba(0, 0, 0, 0.18)"
         summary = str(last_result or "").strip()[:40] or "暂无执行记录"
         return {
-            "component": "VCard",
+            "component": "div",
             "props": {
-                "class": "mb-4",
-                "style": "background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #ffffff;"
+                "style": (
+                    "border-radius: 16px; padding: 22px 24px; margin-bottom: 16px;"
+                    " background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);"
+                    " color: #ffffff; box-shadow: 0 8px 24px rgba(102, 126, 234, 0.25);"
+                )
             },
             "content": [
                 {
-                    "component": "VCardText",
+                    "component": "div",
+                    "props": {
+                        "style": (
+                            "display: flex; align-items: center;"
+                            " justify-content: space-between;"
+                            " flex-wrap: wrap; gap: 16px;"
+                        )
+                    },
                     "content": [
                         {
-                            "component": "VRow",
-                            "props": {"align": "center"},
+                            "component": "div",
                             "content": [
                                 {
-                                    "component": "VCol",
-                                    "props": {"cols": 12, "md": 7},
-                                    "content": [
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "style": "font-size: 13px; opacity: 0.85; letter-spacing: 1px;"
-                                            },
-                                            "text": "魔丸库存"
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "style": "font-size: 42px; font-weight: 700; line-height: 1.1;"
-                                            },
-                                            "text": f"{max(0, pill_count):,}颗"
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {"style": "font-size: 14px; opacity: 0.9;"},
-                                            "text": "魔丸"
-                                        }
-                                    ]
+                                    "component": "div",
+                                    "props": {
+                                        "style": (
+                                            "font-size: 12px; letter-spacing: 2px;"
+                                            " opacity: 0.85;"
+                                        )
+                                    },
+                                    "text": "魔丸库存",
                                 },
                                 {
-                                    "component": "VCol",
-                                    "props": {"cols": 12, "md": 5},
-                                    "content": [
-                                        {
-                                            "component": "VChip",
-                                            "props": {
-                                                "color": "white",
-                                                "variant": "flat",
-                                                "size": "small",
-                                                "class": "mr-2 mb-2"
-                                            },
-                                            "text": status_text
-                                        },
-                                        {
-                                            "component": "VChip",
-                                            "props": {
-                                                "color": "white",
-                                                "variant": "outlined",
-                                                "size": "small",
-                                                "class": "mb-2"
-                                            },
-                                            "text": f"⏱ 定时：{schedule_info}"
-                                        }
-                                    ]
-                                }
-                            ]
+                                    "component": "div",
+                                    "props": {
+                                        "style": (
+                                            "font-size: 44px; font-weight: 800;"
+                                            " line-height: 1.05;"
+                                        )
+                                    },
+                                    "text": f"{max(0, pill_count):,}颗",
+                                },
+                            ],
                         },
                         {
                             "component": "div",
                             "props": {
-                                "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;"
+                                "style": "display: flex; gap: 8px; flex-wrap: wrap;"
                             },
-                            "text": f"🕐 上次执行：{last_update or '尚未执行'}　｜　📝 结果：{summary}"
-                        }
-                    ]
-                }
-            ]
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "style": (
+                                            f"background: {status_bg};"
+                                            " border-radius: 999px; padding: 6px 14px;"
+                                            " font-size: 13px; font-weight: 600;"
+                                        )
+                                    },
+                                    "text": status_text,
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "style": (
+                                            "background: rgba(255, 255, 255, 0.16);"
+                                            " border-radius: 999px; padding: 6px 14px;"
+                                            " font-size: 13px;"
+                                        )
+                                    },
+                                    "text": f"⏱ {schedule_info}",
+                                },
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "component": "div",
+                    "props": {
+                        "style": "font-size: 12px; opacity: 0.85; margin-top: 14px;"
+                    },
+                    "text": (
+                        f"🕐 上次执行：{last_update or '尚未执行'}"
+                        f"　｜　📝 结果：{summary}"
+                    ),
+                },
+            ],
         }
 
     def __brick_progress_card(self, daily: int) -> Dict[str, Any]:

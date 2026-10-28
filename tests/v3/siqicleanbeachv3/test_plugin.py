@@ -143,7 +143,7 @@ def test_metadata_matches_directory():
     cls = module.SiQiCleanBeachV3
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqicleanbeachv3"
-    assert cls.plugin_version == "1.3.0"
+    assert cls.plugin_version == "1.3.1"
     assert cls.plugin_config_prefix == "siqicleanbeachv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.author_url == "https://github.com/tycgd"
@@ -157,7 +157,7 @@ def test_metadata_matches_directory():
     assert entry["name"] == cls.plugin_name
     assert entry["author"] == "tycgd"
     assert entry["level"] == 1
-    assert entry["version"] == "1.3.0"
+    assert entry["version"] == "1.3.1"
 
 
 def test_no_abstract_methods_left():
@@ -836,11 +836,12 @@ def test_rename_and_version_consistency():
     entry = package[cls.__name__]
 
     assert cls.plugin_name == "思齐炼魔丸"
-    assert cls.plugin_version == "1.3.0"
-    assert entry["version"] == "1.3.0"
+    assert cls.plugin_version == "1.3.1"
+    assert entry["version"] == "1.3.1"
     assert entry["name"] == "思齐炼魔丸"
     assert "炼造" in entry["description"]
-    assert next(iter(entry["history"])) == "v1.3.0"
+    assert next(iter(entry["history"])) == "v1.3.1"
+    assert "Hero" in entry["history"]["v1.3.1"]
     assert "详情页" in entry["history"]["v1.3.0"]
     assert "炼造" in entry["history"]["v1.2.0"]
     assert "更名" in entry["history"]["v1.2.0"]
@@ -957,6 +958,19 @@ def test_page_renders_without_data():
     page_text = json.dumps(page, ensure_ascii=False)
     assert "暂无物品数据" in page_text
     assert "暂无执行记录" in page_text
+
+
+def test_page_hero_uses_native_div_background():
+    """Hero 渐变必须由原生 div 承载，挂在 VCard 上会被主题色盖成白底白字。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+
+    hero = plugin.get_page()[0]
+
+    assert hero["component"] == "div"
+    hero_style = hero["props"]["style"]
+    assert "linear-gradient" in hero_style
+    assert "color: #ffffff" in hero_style
 
 
 def test_run_clean_task_crafts_after_collect(monkeypatch):
