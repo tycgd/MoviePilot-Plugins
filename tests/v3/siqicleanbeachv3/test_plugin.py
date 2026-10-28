@@ -143,8 +143,11 @@ def test_metadata_matches_directory():
     cls = module.SiQiCleanBeachV3
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqicleanbeachv3"
-    assert cls.plugin_version == "1.2.0"
+    assert cls.plugin_version == "1.3.0"
     assert cls.plugin_config_prefix == "siqicleanbeachv3_"
+    assert cls.plugin_author == "tycgd"
+    assert cls.author_url == "https://github.com/tycgd"
+    assert cls.auth_level == 1
 
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
@@ -152,6 +155,9 @@ def test_metadata_matches_directory():
     assert f"v{cls.plugin_version}" in entry["history"], "history 缺少当前版本记录"
     assert entry["icon"] == cls.plugin_icon
     assert entry["name"] == cls.plugin_name
+    assert entry["author"] == "tycgd"
+    assert entry["level"] == 1
+    assert entry["version"] == "1.3.0"
 
 
 def test_no_abstract_methods_left():
@@ -830,11 +836,12 @@ def test_rename_and_version_consistency():
     entry = package[cls.__name__]
 
     assert cls.plugin_name == "思齐炼魔丸"
-    assert cls.plugin_version == "1.2.0"
-    assert entry["version"] == "1.2.0"
+    assert cls.plugin_version == "1.3.0"
+    assert entry["version"] == "1.3.0"
     assert entry["name"] == "思齐炼魔丸"
     assert "炼造" in entry["description"]
-    assert next(iter(entry["history"])) == "v1.2.0"
+    assert next(iter(entry["history"])) == "v1.3.0"
+    assert "详情页" in entry["history"]["v1.3.0"]
     assert "炼造" in entry["history"]["v1.2.0"]
     assert "更名" in entry["history"]["v1.2.0"]
 
@@ -854,6 +861,102 @@ def test_get_page_shows_craft_cards():
     assert "4颗" in page_text
     assert "魔丸胚胎" in page_text
     assert "2个" in page_text
+
+
+PAGE_COMPONENT_WHITELIST = {
+    "VCard",
+    "VCardTitle",
+    "VCardText",
+    "VRow",
+    "VCol",
+    "VAlert",
+    "VChip",
+    "VIcon",
+    "VAvatar",
+    "VTable",
+    "VSpacer",
+    "VBtn",
+    "VLabel",
+    "div",
+    "span",
+    "thead",
+    "tbody",
+    "tr",
+    "th",
+    "td",
+}
+
+
+def _collect_components(node, found):
+    """递归收集页面 JSON 中出现的全部 component 名称。"""
+    if isinstance(node, dict):
+        component = node.get("component")
+        if isinstance(component, str):
+            found.add(component)
+        for value in node.values():
+            _collect_components(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_components(item, found)
+    return found
+
+
+def test_page_uses_only_whitelisted_components():
+    """详情页只能使用宿主已验证注册的 Vuetify 组件。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._inventory = {
+        "木材": {"name": "木材", "count": 12, "icon": "🪵"},
+        "魔丸": {"name": "魔丸", "count": 4, "icon": "⚗️"},
+    }
+    plugin._stats["history"] = [
+        {
+            "time": 1793150958,
+            "result": "收集2个垃圾",
+            "total_count": 16,
+            "status": "completed",
+        },
+        {
+            "time": 1793150959,
+            "result": "未能收集垃圾",
+            "total_count": 16,
+            "status": "partial",
+        },
+        {
+            "time": 1793150960,
+            "result": "请求失败",
+            "total_count": 0,
+            "status": "failed",
+        },
+    ]
+
+    found = _collect_components(plugin.get_page(), set())
+
+    assert found
+    assert found <= PAGE_COMPONENT_WHITELIST, found - PAGE_COMPONENT_WHITELIST
+
+
+def test_page_renders_without_data():
+    """空库存、空历史且未配置 Cookie 时详情页仍能正常渲染。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._inventory = {}
+    plugin._stats = {
+        "last_update": None,
+        "last_result": "",
+        "total_items_count": 0,
+        "history": [],
+    }
+    plugin._cookie = ""
+    plugin._bricks = {}
+
+    page = plugin.get_page()
+
+    assert isinstance(page, list)
+    assert page
+    page_text = json.dumps(page, ensure_ascii=False)
+    assert "暂无物品数据" in page_text
+    assert "暂无执行记录" in page_text
 
 
 def test_run_clean_task_crafts_after_collect(monkeypatch):

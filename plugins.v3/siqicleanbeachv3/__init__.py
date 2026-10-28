@@ -26,12 +26,12 @@ class SiQiCleanBeachV3(_PluginBase):
     plugin_name = "思齐炼魔丸"
     plugin_desc = "自动搬砖、清理沙滩并炼造魔丸，支持定时与手动触发。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.0"
-    plugin_author = "bfjy"
-    author_url = "https://bfjy2024.github.io/bfjy"
+    plugin_version = "1.3.0"
+    plugin_author = "tycgd"
+    author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqicleanbeachv3_"
     plugin_order = 30
-    auth_level = 2
+    auth_level = 1
 
     SITE_DOMAIN = "si-qi.xyz"
     BASE_URL = "https://si-qi.xyz"
@@ -533,144 +533,126 @@ class SiQiCleanBeachV3(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        """返回详情页：统计卡片、物品清单与历史记录。"""
-        inventory = self._inventory
-        stats = self._stats
-        
+        """返回详情页：Hero 概览、搬砖进度、统计瓦片、物品清单与执行记录。"""
+        inventory = self._inventory or {}
+        stats = self._stats or {}
+
         last_update = stats.get("last_update", "")
         if last_update:
             try:
-                last_update = datetime.fromtimestamp(last_update).strftime("%Y-%m-%d %H:%M:%S")
-            except:
+                last_update = datetime.fromtimestamp(float(last_update)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            except Exception:
                 last_update = str(last_update)
+        else:
+            last_update = ""
 
-        filtered_inventory = {k: v for k, v in inventory.items() if k != "砖块"}
-        
+        filtered_inventory = {
+            k: v
+            for k, v in inventory.items()
+            if k != "砖块" and isinstance(v, dict)
+        }
+
         total_items = len(filtered_inventory)
-        total_count = sum(item.get("count", 0) for item in filtered_inventory.values())
-        has_items = {k: v for k, v in filtered_inventory.items() if v.get("count", 0) > 0}
+        total_count = sum(
+            max(0, self.__safe_int(item.get("count"), 0))
+            for item in filtered_inventory.values()
+        )
+        has_items = {
+            k: v
+            for k, v in filtered_inventory.items()
+            if max(0, self.__safe_int(v.get("count"), 0)) > 0
+        }
         has_items_count = len(has_items)
 
         bricks = self._bricks or {}
         brick_daily = min(
             self.BRICK_MAX_DAILY, self.__safe_int(bricks.get("daily"), 0)
         )
-        brick_pocket = self.__safe_int(bricks.get("pocket"), 0)
+        brick_pocket = max(0, self.__safe_int(bricks.get("pocket"), 0))
 
         sorted_items = sorted(
             has_items.items(),
-            key=lambda x: x[1].get("count", 0),
+            key=lambda x: max(0, self.__safe_int(x[1].get("count"), 0)),
             reverse=True
         )
 
-        history = stats.get("history", [])[-5:]
+        history = list(stats.get("history") or [])[-5:]
 
         if self._schedule_mode == "interval":
-            schedule_info = f"每{self._interval_minutes}分钟"
+            schedule_info = f"每 {self._interval_minutes} 分钟"
         else:
             schedule_info = f"Cron: {self._cron}"
 
         return [
+            self.__hero_card(
+                self.__item_count("魔丸"),
+                schedule_info,
+                last_update,
+                stats.get("last_result", ""),
+            ),
+            self.__brick_progress_card(brick_daily),
+            {
+                "component": "VRow",
+                "props": {"class": "mb-4"},
+                "content": [
+                    self.__tile("👝", f"{brick_pocket:,}块", "口袋砖块"),
+                    self.__tile(
+                        "🥚", f"{self.__item_count('魔丸胚胎'):,}个", "魔丸胚胎"
+                    ),
+                    self.__tile("🎒", f"{total_items}种", "物品种类"),
+                    self.__tile("📦", f"{total_count:,}个", "物品总数"),
+                ]
+            },
             {
                 "component": "VCard",
-                "props": {"variant": "tonal", "class": "mb-4"},
+                "props": {"variant": "outlined", "class": "mb-4"},
                 "content": [
                     {
                         "component": "VCardTitle",
-                        "text": "🏖️ 思齐炼魔丸数据面板"
-                    },
-                    {
-                        "component": "VCardText",
+                        "props": {"class": "d-flex align-center"},
                         "content": [
+                            {"component": "span", "text": "🎒 物品清单"},
+                            {"component": "VSpacer"},
                             {
-                                "component": "VRow",
-                                "props": {"class": "mb-4"},
-                                "content": [
-                                    self.__stat_card("📦", "物品总数", f"{total_count:,}", "个", "primary"),
-                                    self.__stat_card("📊", "物品种类", f"{total_items}", "种", "info"),
-                                    self.__stat_card("✅", "有物品", f"{has_items_count}", "种", "success"),
-                                    self.__stat_card("🕐", "最后更新", last_update or "-", "", "warning"),
-                                ]
-                            },
-                            {
-                                "component": "VRow",
-                                "props": {"class": "mb-4"},
-                                "content": [
-                                    self.__stat_card(
-                                        "🧱", "今日搬砖",
-                                        f"{brick_daily}/{self.BRICK_MAX_DAILY}", "", "deep-purple"
-                                    ),
-                                    self.__stat_card("👝", "口袋砖块", f"{brick_pocket:,}", "块", "secondary"),
-                                    self.__stat_card(
-                                        "⚗️", "魔丸",
-                                        f"{self.__item_count('魔丸'):,}", "颗", "purple"
-                                    ),
-                                    self.__stat_card(
-                                        "🥚", "魔丸胚胎",
-                                        f"{self.__item_count('魔丸胚胎'):,}", "个", "amber-darken-2"
-                                    ),
-                                ]
+                                "component": "VChip",
+                                "props": {
+                                    "size": "small",
+                                    "variant": "tonal",
+                                    "color": "deep-purple"
+                                },
+                                "text": f"{has_items_count} 种"
                             }
                         ]
                     },
                     {
                         "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    self.__info_col("⏰ 定时模式", schedule_info),
-                                    self.__info_col("📝 最后结果", stats.get("last_result", "-")[:25]),
-                                    self.__info_col("🔔 通知", "开启" if self._notify else "关闭"),
-                                    self.__info_col("🍪 Cookie", "已配置" if self._cookie else "未配置"),
-                                ]
-                            }
-                        ]
+                        "content": (
+                            [
+                                {
+                                    "component": "VAlert",
+                                    "props": {"color": "info", "variant": "tonal"},
+                                    "text": "🏝️ 暂无物品数据，执行一次任务后即可看到库存。"
+                                }
+                            ]
+                            if not sorted_items
+                            else [
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "style": "display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px;"
+                                    },
+                                    "content": self.__inventory_items(sorted_items)
+                                }
+                            ]
+                        )
                     }
                 ]
             },
             {
                 "component": "VCard",
-                "props": {"variant": "tonal", "class": "mb-4"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "text": "🎯 物品清单"
-                    },
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 12},
-                                        "content": [
-                                            {
-                                                "component": "div",
-                                                "props": {
-                                                    "style": "display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px;"
-                                                },
-                                                "content": self.__inventory_items(sorted_items) if sorted_items else [
-                                                    {
-                                                        "component": "div",
-                                                        "props": {"class": "text-center text-medium-emphasis pa-4", "style": "grid-column: 1 / -1; color: #999;"},
-                                                        "text": "🏝️ 暂无物品数据"
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            },
-            {
-                "component": "VCard",
-                "props": {"variant": "tonal"},
+                "props": {"variant": "outlined"},
                 "content": [
                     {
                         "component": "VCardTitle",
@@ -731,103 +713,167 @@ class SiQiCleanBeachV3(_PluginBase):
                 logger.debug(f"移除一次性任务 {job_id} 失败：{e}")
         self._lock = None
 
-    def __inventory_items(self, sorted_items: list) -> List[Dict[str, Any]]:
-        """生成物品卡片网格 - 优化文字颜色对比度"""
-        items = []
-        for name, data in sorted_items:
-            icon = self.ITEM_ICONS.get(name, "📦")
-            color = self.ITEM_COLORS.get(name, "#3498db")
-            count = data.get("count", 0)
-            
-            # 根据颜色亮度决定文字颜色
-            # 对于亮色背景使用深色文字，暗色背景使用亮色文字
-            dark_colors = ["#2c3e50", "#7f8c8d", "#8e44ad", "#d4a574"]
-            text_color = "#ffffff" if color in dark_colors else "#2c3e50"
-            
-            items.append({
-                "component": "div",
-                "props": {
-                    "style": f"""
-                        background: linear-gradient(145deg, {color}25, {color}08);
-                        border-radius: 16px;
-                        padding: 20px 16px;
-                        text-align: center;
-                        border: 1px solid {color}30;
-                        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-                        transition: transform 0.2s, box-shadow 0.2s;
-                    """
-                },
-                "content": [
-                    {
-                        "component": "div",
-                        "props": {"style": f"font-size: 40px; margin-bottom: 6px; display: block;"},
-                        "text": icon
-                    },
-                    {
-                        "component": "div",
-                        "props": {"style": f"font-size: 14px; font-weight: 600; color: {text_color}; margin-bottom: 4px; letter-spacing: 0.3px;"},
-                        "text": name
-                    },
-                    {
-                        "component": "div",
-                        "props": {"style": f"font-size: 24px; font-weight: bold; color: {color}; text-shadow: 0 1px 4px rgba(0,0,0,0.1);"},
-                        "text": f"{count:,}"
-                    },
-                    {
-                        "component": "div",
-                        "props": {
-                            "style": f"width: 100%; height: 4px; background: {color}20; border-radius: 4px; margin-top: 10px; overflow: hidden;"
-                        },
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": f"width: {min(100, count / 10)}%; height: 100%; background: linear-gradient(90deg, {color}, {color}80); border-radius: 4px;"
-                                }
-                            }
-                        ]
-                    }
-                ]
-            })
-        return items
-
-    @staticmethod
-    def __stat_card(icon: str, label: str, value: str, suffix: str, color: str) -> Dict[str, Any]:
+    def __hero_card(
+        self,
+        pill_count: int,
+        schedule_info: str,
+        last_update: str,
+        last_result: str,
+    ) -> Dict[str, Any]:
+        """生成顶部渐变 Hero 卡片：魔丸库存、状态、定时与上次执行摘要。"""
+        status_text = "⚡ 已启用" if self._enabled else "💤 已停用"
+        summary = str(last_result or "").strip()[:40] or "暂无执行记录"
         return {
-            "component": "VCol",
-            "props": {"cols": 6, "md": 3},
+            "component": "VCard",
+            "props": {
+                "class": "mb-4",
+                "style": "background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #ffffff;"
+            },
             "content": [
                 {
-                    "component": "VCard",
-                    "props": {
-                        "color": color,
-                        "variant": "tonal",
-                        "class": "pa-3"
-                    },
+                    "component": "VCardText",
                     "content": [
                         {
-                            "component": "div",
-                            "props": {"class": "d-flex align-center"},
+                            "component": "VRow",
+                            "props": {"align": "center"},
                             "content": [
                                 {
-                                    "component": "div",
-                                    "props": {"class": "text-h4 mr-2"},
-                                    "text": icon
-                                },
-                                {
-                                    "component": "div",
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 7},
                                     "content": [
                                         {
                                             "component": "div",
-                                            "props": {"class": "text-caption text-medium-emphasis"},
-                                            "text": label
+                                            "props": {
+                                                "style": "font-size: 13px; opacity: 0.85; letter-spacing: 1px;"
+                                            },
+                                            "text": "魔丸库存"
                                         },
                                         {
                                             "component": "div",
-                                            "props": {"class": "text-h6 font-weight-bold"},
-                                            "text": f"{value}{suffix}"
+                                            "props": {
+                                                "style": "font-size: 42px; font-weight: 700; line-height: 1.1;"
+                                            },
+                                            "text": f"{max(0, pill_count):,}颗"
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {"style": "font-size: 14px; opacity: 0.9;"},
+                                            "text": "魔丸"
                                         }
                                     ]
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 5},
+                                    "content": [
+                                        {
+                                            "component": "VChip",
+                                            "props": {
+                                                "color": "white",
+                                                "variant": "flat",
+                                                "size": "small",
+                                                "class": "mr-2 mb-2"
+                                            },
+                                            "text": status_text
+                                        },
+                                        {
+                                            "component": "VChip",
+                                            "props": {
+                                                "color": "white",
+                                                "variant": "outlined",
+                                                "size": "small",
+                                                "class": "mb-2"
+                                            },
+                                            "text": f"⏱ 定时：{schedule_info}"
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;"
+                            },
+                            "text": f"🕐 上次执行：{last_update or '尚未执行'}　｜　📝 结果：{summary}"
+                        }
+                    ]
+                }
+            ]
+        }
+
+    def __brick_progress_card(self, daily: int) -> Dict[str, Any]:
+        """生成今日搬砖进度卡片，进度条用 div 宽度百分比实现。"""
+        total = max(1, self.BRICK_MAX_DAILY)
+        daily = min(total, max(0, daily))
+        percent = min(100.0, daily / total * 100)
+        full = daily >= total
+        bar_color = (
+            "linear-gradient(90deg, #2e7d32, #66bb6a)"
+            if full
+            else "linear-gradient(90deg, #667eea, #764ba2)"
+        )
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "mb-4"},
+            "content": [
+                {
+                    "component": "VCardText",
+                    "content": [
+                        {
+                            "component": "VRow",
+                            "props": {"align": "center", "class": "mb-1"},
+                            "content": [
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 8},
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "style": "font-weight: 600; color: #4527a0;"
+                                            },
+                                            "text": "🧱 今日搬砖"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 4, "class": "text-right"},
+                                    "content": [
+                                        {
+                                            "component": "span",
+                                            "props": {
+                                                "style": "font-weight: 700; color: #5e35b1;"
+                                            },
+                                            "text": f"{daily}/{total}"
+                                        },
+                                        {
+                                            "component": "span",
+                                            "props": {
+                                                "style": "font-size: 12px; color: "
+                                                + ("#2e7d32" if full else "#7e57c2")
+                                                + "; margin-left: 6px;"
+                                            },
+                                            "text": "已满" if full else f"还差 {total - daily} 块"
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": "height: 14px; background: #ede7f6; border-radius: 999px; overflow: hidden;"
+                            },
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "style": f"width: {percent:.1f}%; height: 100%; "
+                                        f"background: {bar_color}; border-radius: 999px; "
+                                        "transition: width 0.3s ease;"
+                                    }
                                 }
                             ]
                         }
@@ -836,6 +882,109 @@ class SiQiCleanBeachV3(_PluginBase):
             ]
         }
 
+    @staticmethod
+    def __tile(icon: str, value: str, label: str) -> Dict[str, Any]:
+        """生成柔和高圆角统计瓦片。"""
+        return {
+            "component": "VCol",
+            "props": {"cols": 6, "md": 3},
+            "content": [
+                {
+                    "component": "div",
+                    "props": {
+                        "style": "background: #f5f3ff; border-radius: 12px; "
+                        "padding: 14px; height: 100%;"
+                    },
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"style": "font-size: 20px;"},
+                            "text": icon
+                        },
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": "font-size: 22px; font-weight: 700; "
+                                "color: #5e35b1; line-height: 1.3;"
+                            },
+                            "text": value
+                        },
+                        {
+                            "component": "div",
+                            "props": {"style": "font-size: 12px; color: #7e57c2;"},
+                            "text": label
+                        }
+                    ]
+                }
+            ]
+        }
+
+    def __inventory_items(self, sorted_items: list) -> List[Dict[str, Any]]:
+        """生成物品卡片网格：左侧 emoji 圆形图标 + 右下角数量徽标。"""
+        items = []
+        for name, data in sorted_items:
+            icon = self.ITEM_ICONS.get(name, "📦")
+            color = self.ITEM_COLORS.get(name, "#3498db")
+            count = max(0, self.__safe_int((data or {}).get("count"), 0))
+            items.append({
+                "component": "div",
+                "props": {
+                    "style": (
+                        "position: relative; display: flex; align-items: center; "
+                        "gap: 10px; background: #fafafa; border: 1px solid #eeeeee; "
+                        f"border-left: 4px solid {color}; border-radius: 12px; "
+                        "padding: 12px 14px; min-height: 76px;"
+                    )
+                },
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {
+                            "style": (
+                                "width: 40px; height: 40px; flex: 0 0 40px; "
+                                "border-radius: 50%; display: flex; "
+                                "align-items: center; justify-content: center; "
+                                f"font-size: 20px; background: {color}1f;"
+                            )
+                        },
+                        "text": icon
+                    },
+                    {
+                        "component": "div",
+                        "props": {"style": "min-width: 0; flex: 1;"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 13px; font-weight: 600; "
+                                    "color: #424242; white-space: nowrap; "
+                                    "overflow: hidden; text-overflow: ellipsis;"
+                                },
+                                "text": name
+                            },
+                            {
+                                "component": "div",
+                                "props": {"style": "font-size: 12px; color: #9e9e9e;"},
+                                "text": "库存"
+                            }
+                        ]
+                    },
+                    {
+                        "component": "div",
+                        "props": {
+                            "style": (
+                                "position: absolute; right: 8px; bottom: 8px; "
+                                f"background: {color}; color: #ffffff; "
+                                "border-radius: 999px; padding: 0 8px; "
+                                "font-size: 11px; font-weight: 600; line-height: 18px;"
+                            )
+                        },
+                        "text": f"×{count:,}"
+                    }
+                ]
+            })
+        return items
+
     def __item_count(self, name: str) -> int:
         """读取库存中某个物品的数量，兼容字典与整数两种存储形式。"""
         entry = (self._inventory or {}).get(name)
@@ -843,57 +992,52 @@ class SiQiCleanBeachV3(_PluginBase):
             return max(0, self.__safe_int(entry.get("count"), 0))
         return max(0, self.__safe_int(entry, 0))
 
-    @staticmethod
-    def __info_col(label: str, value: Any) -> Dict[str, Any]:
-        return {
-            "component": "VCol",
-            "props": {"cols": 6, "md": 3},
-            "content": [
-                {
-                    "component": "div",
-                    "props": {"class": "text-caption text-medium-emphasis"},
-                    "text": label
-                },
-                {
-                    "component": "div",
-                    "props": {"class": "text-h6"},
-                    "text": str(value or "-")
-                }
-            ]
-        }
-
     def __history_rows(self, history: list) -> List[Dict[str, Any]]:
+        """生成执行记录表格行，状态以彩色 VChip 展示。"""
         rows = []
         for record in reversed(history):
+            record = record or {}
             time_str = record.get("time", "")
             if isinstance(time_str, (int, float)):
                 try:
-                    time_str = datetime.fromtimestamp(time_str).strftime("%Y-%m-%d %H:%M:%S")
-                except:
+                    time_str = datetime.fromtimestamp(time_str).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                except Exception:
                     time_str = str(time_str)
-            
-            status_color = "success" if record.get("status") == "completed" else "warning"
-            status_text = "✅ 成功" if record.get("status") == "completed" else "⚠️ 失败"
-            result_text = record.get("result", "-")
-            total_count = record.get("total_count", 0)
-            
+
+            status = str(record.get("status") or "")
+            result_text = str(record.get("result") or "-")
+            if status == "partial":
+                chip_color, chip_text = "warning", "⚠️ 部分成功"
+            elif status in ("failed", "error", "auth_failed"):
+                chip_color, chip_text = "error", "❌ 失败"
+            elif "冷却" in result_text:
+                chip_color, chip_text = "success", "🧊 冷却中"
+            else:
+                chip_color, chip_text = "success", "✅ 成功"
+
+            total_count = max(0, self.__safe_int(record.get("total_count"), 0))
             rows.append({
                 "component": "tr",
                 "content": [
                     {"component": "td", "text": time_str},
                     {"component": "td", "text": result_text[:30]},
-                    {"component": "td", "text": f"{total_count:,}" if total_count > 0 else "-"},
+                    {
+                        "component": "td",
+                        "text": f"{total_count:,}" if total_count > 0 else "-"
+                    },
                     {
                         "component": "td",
                         "content": [
                             {
                                 "component": "VChip",
                                 "props": {
-                                    "color": status_color,
+                                    "color": chip_color,
                                     "size": "small",
                                     "variant": "tonal"
                                 },
-                                "text": status_text
+                                "text": chip_text
                             }
                         ]
                     }
