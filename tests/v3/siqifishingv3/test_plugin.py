@@ -122,7 +122,7 @@ def make_config(**overrides) -> dict:
         "auto_task": False,
         "auto_guess": False,
         "guess_value": 0,
-        "slot_spread": False,
+        "slot_strategy": "off",
         "per_slot_casts": 8,
         "run_once": False,
     }
@@ -163,7 +163,7 @@ def build_plugin(module):
     plugin._auto_guess = False
     plugin._guess_value = 0
 
-    plugin._slot_spread = False
+    plugin._slot_strategy = "off"
     plugin._per_slot_casts = 8
 
     plugin._lock = None
@@ -344,7 +344,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.1.1"
+    assert cls.plugin_version == "1.2.0"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -416,7 +416,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.1.1"
+    assert cls.plugin_version == "1.2.0"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -657,11 +657,11 @@ def test_site_remaining_zero_skips(monkeypatch):
 
 
 def test_slot_spread_limit(monkeypatch):
-    """开启时段分散后每个时段最多抛 per_slot_casts 次。"""
+    """manual 策略下每个时段最多抛 per_slot_casts 次。"""
     module = load_plugin_module()
 
     def configure(plugin):
-        plugin._slot_spread = True
+        plugin._slot_strategy = "manual"
         plugin._per_slot_casts = 1
         plugin._max_casts_per_run = 5
         plugin._daily["slots"] = {}
@@ -1726,15 +1726,12 @@ def test_deliver_only_ready_tasks(monkeypatch):
 
 
 def test_page_lure_buttons_disabled_without_stock():
-    """零库存鱼饵的快捷按钮必须禁用，有库存的保持可点。"""
+    """零库存鱼饵降级为文本，有库存的仍保持可点。"""
     module = load_plugin_module()
     plugin = build_plugin(module)
     page = _rich_page(plugin, lures={"normal": 5, "insect": 0})
 
-    empty = _option_buttons(page, "lure_fixed", "insect")
-    assert empty, "零库存鱼饵也应渲染为禁用按钮"
-    for node in empty:
-        assert (node.get("props") or {}).get("disabled") is True, node
+    assert not _option_buttons(page, "lure_fixed", "insect"), "零库存鱼饵不得渲染为按钮"
 
     stocked = _option_buttons(page, "lure_fixed", "normal")
     assert stocked, "有库存鱼饵必须提供可点按钮"
@@ -1773,14 +1770,14 @@ def test_page_running_chip_when_locked():
 
 
 def test_page_quick_action_cards():
-    """详情页新增快捷操作与策略调节两张卡片。"""
+    """详情页保留快捷操作卡，策略调节拆成投放区。"""
     module = load_plugin_module()
     plugin = build_plugin(module)
 
     page_text = json.dumps(_rich_page(plugin), ensure_ascii=False)
 
     assert "⚡ 快捷操作" in page_text
-    assert "🎛 策略调节" in page_text
+    assert "🎣 投放" in page_text
 
 
 def test_option_label_covers_whitelist():
@@ -1803,6 +1800,473 @@ def test_option_label_covers_whitelist():
         assert isinstance(text, str) and text.strip(), key
 
     assert isinstance(label("unknown_key"), str)
+
+
+# ---------------------------------------------------------------------------
+# v1.2.0：时段配额、时段网格与详情页四态按钮
+# ---------------------------------------------------------------------------
+
+
+def _slot_static(name: str):
+    """取插件内部的时段相关静态纯函数。"""
+    module = load_plugin_module()
+    return getattr(module.SiQiFishingV3, f"_SiQiFishingV3__{name}")
+
+
+def _plan_slot_casts(module):
+    """取插件的时段配额规划函数。"""
+    return getattr(module.SiQiFishingV3, "_SiQiFishingV3__plan_slot_casts")
+
+
+def _expected_casts(
+    plan,
+    *,
+    strategy: str,
+    site_used: int,
+    site_limit: int,
+    plugin_casts: int,
+    daily_limit: int,
+    slot: int,
+    per_slot: int,
+    max_per_run: int,
+) -> int:
+    """按同一规划函数逐竿推演，得到本次运行的理论竿数。"""
+    casts = 0
+    used_site = site_used
+    used_plugin = plugin_casts
+    slot_used = 0
+    while casts < max_per_run:
+        step = plan(
+            strategy=strategy,
+            site_used=used_site,
+            site_limit=site_limit,
+            plugin_casts=used_plugin,
+            daily_limit=daily_limit,
+            slot=slot,
+            slot_used=slot_used,
+            per_slot=per_slot,
+            max_per_run=max_per_run - casts,
+        )
+        if step <= 0:
+            break
+        casts += 1
+        used_site += 1
+        used_plugin += 1
+        slot_used += 1
+    return casts
+
+
+def _node_style_text(node) -> str:
+    """取节点 style 文本，缺失时回退为节点 JSON。"""
+    if isinstance(node, dict):
+        props = node.get("props")
+        if isinstance(props, dict) and isinstance(props.get("style"), str):
+            return props["style"]
+    return json.dumps(node, ensure_ascii=False)
+
+
+def _node_text(node) -> str:
+    """把节点整体序列化为可搜索的文本。"""
+    return json.dumps(node, ensure_ascii=False)
+
+
+def _vbtn_nodes(page) -> list:
+    """收集页面中的全部 VBtn 节点。"""
+    return [
+        node
+        for node in _iter_nodes(page)
+        if isinstance(node, dict) and node.get("component") == "VBtn"
+    ]
+
+
+def _btn_props(node) -> dict:
+    """返回按钮节点的 props 字典。"""
+    props = node.get("props")
+    return props if isinstance(props, dict) else {}
+
+
+def _btn_api(node) -> str:
+    """返回按钮点击事件绑定的插件 API 路径。"""
+    events = node.get("events")
+    if not isinstance(events, dict):
+        return ""
+    click = events.get("click")
+    if not isinstance(click, dict):
+        return ""
+    return str(click.get("api") or "")
+
+
+def test_slot_quota_values():
+    """时段配额为剩余次数按剩余时段向上取整。"""
+    quota = _slot_static("slot_quota")
+
+    assert quota(21, 4) == 6
+    assert quota(1, 6) == 1
+    assert quota(0, 6) == 0
+    assert quota(12, 1) == 12
+    assert quota(7, 3) == 3
+    assert quota(5, 0) == 5
+    assert quota(5, -1) == 5
+    assert quota(-3, 4) == 0
+
+
+def test_slots_left_values():
+    """剩余时段数夹取在 1~6，且时段从 1 开始计数。"""
+    left = _slot_static("slots_left")
+
+    assert left(1) == 6
+    assert left(3) == 4
+    assert left(6) == 1
+    assert left(0) == 6
+    assert left(7) == 1
+
+
+def test_effective_limit_values():
+    """站点上限缺省时回落到插件日限，否则取两者较小值。"""
+    limit = _slot_static("effective_limit")
+
+    assert limit(33, 0) == 33
+    assert limit(33, 50) == 33
+    assert limit(40, 30) == 30
+    assert limit(33, -1) == 33
+
+
+def test_remaining_casts_site_first():
+    """站点口径可用时只看站点剩余，不受插件本地计数影响。"""
+    remaining = _slot_static("remaining_casts")
+
+    assert remaining(12, 33, 0, 33) == 21
+    assert remaining(40, 33, 0, 33) == 0
+    assert remaining(12, 33, 99, 33) == 21
+
+
+def test_remaining_casts_fallback():
+    """站点上限未知时回落到插件日限。"""
+    remaining = _slot_static("remaining_casts")
+
+    assert remaining(0, 0, 12, 33) == 21
+    assert remaining(0, 0, 40, 33) == 0
+
+
+def _plan(**kwargs) -> int:
+    """以默认参数调用时段配额规划函数。"""
+    defaults = {
+        "strategy": "auto",
+        "site_used": 12,
+        "site_limit": 33,
+        "plugin_casts": 12,
+        "daily_limit": 33,
+        "slot": 3,
+        "slot_used": 0,
+        "per_slot": 8,
+        "max_per_run": 40,
+    }
+    defaults.update(kwargs)
+    return _plan_slot_casts(load_plugin_module())(**defaults)
+
+
+def test_plan_auto_quota():
+    """auto 策略按剩余次数与剩余时段自动均分。"""
+    assert _plan(strategy="auto", max_per_run=40) == 6
+
+
+def test_plan_auto_respects_max_per_run():
+    """auto 策略仍受单次上限约束。"""
+    assert _plan(strategy="auto", max_per_run=4) == 4
+
+
+def test_plan_auto_exhausted_slot():
+    """auto 策略下时段配额已满时返回 0。"""
+    assert _plan(strategy="auto", slot_used=6) == 0
+
+
+def test_plan_manual_uses_per_slot():
+    """manual 策略以每时段上限为准。"""
+    assert _plan(strategy="manual", slot_used=3, per_slot=8) == 5
+    assert _plan(strategy="manual", slot_used=8, per_slot=8) == 0
+
+
+def test_plan_auto_ignores_per_slot():
+    """auto 策略忽略手动每时段上限。"""
+    assert _plan(strategy="auto", per_slot=1, max_per_run=6, slot_used=0) == 6
+
+
+def test_plan_off_ignores_slot_used():
+    """off 策略完全不看时段用量。"""
+    assert _plan(strategy="off", slot_used=99, max_per_run=6) == 6
+
+
+def test_plan_site_used_dominates():
+    """站点剩余次数优先决定配额。"""
+    assert (
+        _plan(
+            strategy="auto",
+            site_used=30,
+            site_limit=33,
+            plugin_casts=2,
+            slot=6,
+            max_per_run=40,
+        )
+        == 3
+    )
+
+
+def test_slot_grid_shape():
+    """6 格时段网格标出当前格、配额与未来格。"""
+    grid_fn = _slot_static("slot_grid")
+    grid = grid_fn({"1": 6, "2": 6}, 3, "auto", 8, 6)
+
+    assert isinstance(grid, list)
+    assert len(grid) == 6
+    assert "6" in _node_text(grid[0])
+
+    current = grid[2]
+    assert "#2563eb" in _node_style_text(current), current
+    assert "▶" in _node_text(current)
+    assert "0/6" in _node_text(current)
+    assert "–" in _node_text(grid[5])
+
+    off_grid = grid_fn({"1": 6, "2": 6}, 3, "off", 8, 6)
+    assert "–" in _node_text(off_grid[2])
+
+
+def test_auto_mode_casts_match_plan(monkeypatch):
+    """auto 策略的实际竿数与同一配额函数推演一致（固定时段，避免跨 4 小时边界漂移）。"""
+    module = load_plugin_module()
+    slot = 3
+    monkeypatch.setattr(
+        module.SiQiFishingV3,
+        "_SiQiFishingV3__time_slot",
+        staticmethod(lambda hour=0: slot),
+    )
+    max_per_run = 6
+    expected = _expected_casts(
+        _plan_slot_casts(module),
+        strategy="auto",
+        site_used=12,
+        site_limit=33,
+        plugin_casts=0,
+        daily_limit=33,
+        slot=slot,
+        per_slot=8,
+        max_per_run=max_per_run,
+    )
+
+    assert 0 < expected <= max_per_run
+    assert _current_slot(module) == slot
+
+    plugin, _ = _run_task(
+        module,
+        monkeypatch,
+        data=make_data(attempts_used=12, attempts_limit=33),
+        responses={
+            "perform_fishing": [
+                cast_with_data(12 + index, 33) for index in range(1, max_per_run + 3)
+            ]
+        },
+        configure=lambda p: (
+            setattr(p, "_slot_strategy", "auto"),
+            setattr(p, "_max_casts_per_run", max_per_run),
+            setattr(p, "_daily_cast_limit", 33),
+        ),
+    )
+
+    assert _current_slot(module) == slot
+    assert set(plugin._daily["slots"]) <= {str(slot)}, plugin._daily["slots"]
+    assert ActionRequestUtils.actions.count("perform_fishing") == expected
+
+
+def test_manual_mode_casts_one(monkeypatch):
+    """manual 策略且每时段上限为 1 时只抛一竿。"""
+    _run_task(
+        load_plugin_module(),
+        monkeypatch,
+        responses={"perform_fishing": [catch_response() for _ in range(10)]},
+        configure=lambda p: (
+            setattr(p, "_slot_strategy", "manual"),
+            setattr(p, "_per_slot_casts", 1),
+            setattr(p, "_max_casts_per_run", 6),
+        ),
+    )
+
+    assert ActionRequestUtils.actions.count("perform_fishing") == 1
+
+
+def test_auto_mode_ignores_per_slot_integration(monkeypatch):
+    """auto 策略下 per_slot_casts 不参与实际限流。"""
+    _run_task(
+        load_plugin_module(),
+        monkeypatch,
+        responses={"perform_fishing": [catch_response() for _ in range(10)]},
+        configure=lambda p: (
+            setattr(p, "_slot_strategy", "auto"),
+            setattr(p, "_per_slot_casts", 1),
+            setattr(p, "_max_casts_per_run", 3),
+        ),
+    )
+
+    assert ActionRequestUtils.actions.count("perform_fishing") == 3
+
+
+def test_slot_quota_exhausted_stops(monkeypatch):
+    """时段配额用尽后提前停止并说明原因。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(
+        module.SiQiFishingV3,
+        "_SiQiFishingV3__time_slot",
+        staticmethod(lambda hour=0: 1),
+    )
+    plugin, result = _run_task(
+        module,
+        monkeypatch,
+        data=make_data(attempts_used=44, attempts_limit=50),
+        responses={
+            "perform_fishing": [
+                cast_with_data(44 + index, 50) for index in range(1, 8)
+            ]
+        },
+        configure=lambda p: (
+            setattr(p, "_slot_strategy", "auto"),
+            setattr(p, "_max_casts_per_run", 6),
+            setattr(p, "_daily_cast_limit", 99),
+        ),
+    )
+
+    assert ActionRequestUtils.actions.count("perform_fishing") == 1
+    assert result["status"] == "partial", result
+    assert "本时段配额" in json.dumps(result, ensure_ascii=False), result
+    assert plugin._daily["casts"] == 1
+
+
+def test_roll_daily_on_new_date_in_loop(monkeypatch):
+    """跨自然日时循环内重置当日计数与时段用量。"""
+    module = load_plugin_module()
+    slot = _current_slot(module)
+    yesterday = (
+        datetime.now(_timezone(module)) - timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    def configure(plugin):
+        plugin._daily["date"] = yesterday
+        plugin._daily["casts"] = 5
+        plugin._daily["slots"] = {str(slot): 5}
+        plugin._max_casts_per_run = 2
+
+    plugin, _ = _run_task(
+        module,
+        monkeypatch,
+        responses={"perform_fishing": [catch_response() for _ in range(5)]},
+        configure=configure,
+    )
+
+    assert plugin._daily["date"] == _today(module)
+    assert plugin._daily["casts"] == 2
+    assert sum(plugin._daily["slots"].values()) == 2
+    assert plugin._daily["slots"].get(str(slot)) == 2
+
+
+def test_page_button_states():
+    """按钮四态：选中实心、未选中描边、不可用中灰、消耗型红色。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    page = _rich_page(plugin, tasks_ready=0, tasks={})
+    buttons = _vbtn_nodes(page)
+
+    assert buttons, "详情页必须提供按钮"
+
+    selected = [
+        node
+        for node in buttons
+        if _btn_props(node).get("variant") == "flat"
+        and _btn_props(node).get("color") == "primary"
+        and _btn_props(node).get("disabled") is not True
+    ]
+    assert selected, "缺少选中态按钮（flat + primary）"
+
+    unselected = [
+        node
+        for node in buttons
+        if _btn_props(node).get("variant") == "outlined"
+        and _btn_props(node).get("color") == "#475569"
+        and _btn_props(node).get("disabled") is not True
+    ]
+    assert unselected, "缺少未选中态按钮（outlined + #475569）"
+
+    disabled = [
+        node
+        for node in buttons
+        if _btn_props(node).get("disabled") is True
+        and _btn_props(node).get("color") == "#6b7280"
+    ]
+    assert disabled, "缺少不可用态按钮（#6b7280 + disabled）"
+
+    for suffix in ("/fish_now", "/run"):
+        danger = [node for node in buttons if _btn_api(node).endswith(suffix)]
+        assert danger, f"缺少 {suffix} 按钮"
+        for node in danger:
+            assert _btn_props(node).get("variant") == "tonal", node
+            assert _btn_props(node).get("color") == "error", node
+
+
+def test_page_zero_stock_lure_is_span():
+    """零库存鱼饵不再渲染按钮，而是降级为文本。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    page = _rich_page(plugin, lures={"normal": 5, "insect": 0})
+
+    assert not _option_buttons(page, "lure_fixed", "insect"), "零库存鱼饵不得出现按钮"
+    assert "∅" in json.dumps(page, ensure_ascii=False)
+
+
+def test_page_sections_present():
+    """详情页包含投放/鱼饵/鱼竿/自动化四区与今日概览。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+
+    page_text = json.dumps(_rich_page(plugin), ensure_ascii=False)
+
+    for title in ("🎣 投放", "🪱 鱼饵", "🪝 鱼竿", "🤖 自动化", "📊 今日概览"):
+        assert title in page_text, title
+
+
+def test_slot_strategy_option():
+    """slot_strategy 三值可提交，slot_spread 与 per_slot_casts 被拒。"""
+    normalize = getattr(
+        load_plugin_module().SiQiFishingV3, "_SiQiFishingV3__normalize_option"
+    )
+
+    ok, value, message = normalize("slot_strategy", "auto")
+    assert ok is True, message
+    assert value == "auto"
+
+    for key, raw in (
+        ("slot_strategy", "turbo"),
+        ("slot_spread", "true"),
+        ("per_slot_casts", "8"),
+    ):
+        ok, _, message = normalize(key, raw)
+        assert ok is False, (key, raw)
+        assert str(message).strip(), (key, raw)
+
+
+def test_slot_strategy_migration(monkeypatch):
+    """旧 slot_spread 迁移为 manual/off，显式 slot_strategy 优先。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    monkeypatch.setattr(
+        module.scheduler_sdk, "add_plugin_once_job", lambda *a, **k: None
+    )
+
+    def build(**config):
+        plugin = build_plugin(module)
+        plugin.init_plugin({"enabled": True, **config})
+        return plugin
+
+    assert build(slot_spread=True)._slot_strategy == "manual"
+    assert build(slot_spread=False)._slot_strategy == "off"
+    assert build()._slot_strategy == "off"
+    assert build(slot_strategy="auto")._slot_strategy == "auto"
+    assert build(slot_spread=True, slot_strategy="auto")._slot_strategy == "auto"
 
 
 _MISSING = object()

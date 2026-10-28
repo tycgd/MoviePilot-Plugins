@@ -26,7 +26,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.2.0"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -102,7 +102,11 @@ class SiQiFishingV3(_PluginBase):
         "dry_run": {"type": "bool", "label": "演练模式"},
         "auto_task": {"type": "bool", "label": "自动交付任务"},
         "auto_guess": {"type": "bool", "label": "自动竞猜"},
-        "slot_spread": {"type": "bool", "label": "时段分散"},
+        "slot_strategy": {
+            "type": "enum",
+            "label": "时段分配",
+            "values": ("auto", "manual", "off"),
+        },
         "buy_budget_per_day": {
             "type": "int",
             "label": "每日购饵预算",
@@ -166,7 +170,7 @@ class SiQiFishingV3(_PluginBase):
     _auto_guess = False
     _guess_value = 0
 
-    _slot_spread = False
+    _slot_strategy = "off"
     _per_slot_casts = 8
 
     ONCE_JOB_IDS = ("run_once", "api_run_once", "command_run_once")
@@ -260,7 +264,14 @@ class SiQiFishingV3(_PluginBase):
         self._auto_guess = bool(config.get("auto_guess", False))
         self._guess_value = max(0, self.__safe_int(config.get("guess_value"), 0))
 
-        self._slot_spread = bool(config.get("slot_spread", False))
+        slot_strategy = str(config.get("slot_strategy") or "").strip().lower()
+        if slot_strategy not in ("auto", "manual", "off"):
+            # 旧配置只有 slot_spread 布尔值：开启视为手动，关闭或缺失视为不分时段
+            legacy_spread = config.get("slot_spread", False)
+            if isinstance(legacy_spread, str):
+                legacy_spread = legacy_spread.strip().lower() in ("true", "1", "yes", "on")
+            slot_strategy = "manual" if legacy_spread else "off"
+        self._slot_strategy = slot_strategy
         self._per_slot_casts = max(
             1, self.__safe_int(config.get("per_slot_casts"), 8, min_value=1)
         )
@@ -808,11 +819,19 @@ class SiQiFishingV3(_PluginBase):
                                 12,
                                 3,
                                 {
-                                    "component": "VSwitch",
+                                    "component": "VSelect",
                                     "props": {
-                                        "model": "slot_spread",
-                                        "label": "按时段分散抛竿",
-                                        "hint": "避免单一时段用光次数",
+                                        "model": "slot_strategy",
+                                        "label": "时段分配",
+                                        "items": [
+                                            {
+                                                "title": "自动（按剩余次数平均）",
+                                                "value": "auto",
+                                            },
+                                            {"title": "手动（每时段固定）", "value": "manual"},
+                                            {"title": "关闭（不限时段）", "value": "off"},
+                                        ],
+                                        "hint": "GMT+8 每 4 小时一段，每日 6 段",
                                     },
                                 },
                             ),
@@ -831,7 +850,7 @@ class SiQiFishingV3(_PluginBase):
                                         "label": "每时段上限",
                                         "type": "number",
                                         "min": 1,
-                                        "hint": "分散模式下生效，GMT+8 每 4 小时一段",
+                                        "hint": "手动模式下生效，GMT+8 每 4 小时一段",
                                     },
                                 },
                             ),
@@ -864,13 +883,13 @@ class SiQiFishingV3(_PluginBase):
             "auto_task": self._auto_task,
             "auto_guess": self._auto_guess,
             "guess_value": self._guess_value,
-            "slot_spread": self._slot_spread,
+            "slot_strategy": self._slot_strategy,
             "per_slot_casts": self._per_slot_casts,
             "run_once": False,
         }
 
     def get_page(self) -> List[dict]:
-        """详情页：Hero 概览、次数进度、统计瓦片、快捷操作、策略调节、鱼饵库存、记录与配置摘要。"""
+        """详情页：Hero 概览、今日概览、快捷操作、策略调节、鱼饵库存、记录与配置摘要。"""
         state = self._state or {}
         daily = self._daily or {}
 
@@ -885,7 +904,7 @@ class SiQiFishingV3(_PluginBase):
 
         attempts_used = max(0, self.__safe_int(state.get("attempts_used"), 0))
         attempts_limit = max(0, self.__safe_int(state.get("attempts_limit"), 0))
-        catches = max(0, self.__safe_int(state.get("catches"), 0))
+        daily_casts = max(0, self.__safe_int(daily.get("casts"), 0))
         lures = state.get("lures") or {}
         selected_lure = state.get("selected_lure") or ""
 
@@ -894,8 +913,6 @@ class SiQiFishingV3(_PluginBase):
             for v in lures.values()
             if isinstance(v, (int, float))
         )
-        codex_total = max(0, self.__safe_int(state.get("codex_total"), 0))
-        codex_unlocked = max(0, self.__safe_int(state.get("codex_unlocked"), 0))
 
         if self._schedule_mode == "interval":
             schedule_info = f"每 {self._interval_minutes} 分钟"
@@ -923,50 +940,28 @@ class SiQiFishingV3(_PluginBase):
             if self._auto_buy
             else "不自动购买鱼饵"
         )
+        slot_info = {
+            "auto": "自动平均分配",
+            "manual": f"每时段最多 {self._per_slot_casts} 次",
+        }.get(self._slot_strategy, "不限制时段")
 
         return [
             self.__hero_card(
-                catches,
-                f"{attempts_used}/{attempts_limit or '?'}",
+                self.__remaining_casts(
+                    attempts_used,
+                    attempts_limit,
+                    daily_casts,
+                    self._daily_cast_limit,
+                ),
+                daily_casts,
+                self._daily_cast_limit,
+                attempts_limit,
+                lure_total,
                 schedule_info,
                 updated_at,
                 daily.get("last_result", "") or state.get("last_message", ""),
             ),
-            self.__attempt_progress_card(attempts_used, attempts_limit),
-            {
-                "component": "VRow",
-                "props": {"class": "mb-4"},
-                "content": [
-                    self.__tile("🎣", f"{catches:,}条", "今日渔获"),
-                    self.__tile("🪱", f"{lure_total:,}枚", "鱼饵库存"),
-                    self.__tile(
-                        "📖", f"{codex_unlocked}/{codex_total or '?'}", "图鉴解锁"
-                    ),
-                    self.__tile(
-                        "💰",
-                        f"{self.__safe_int(state.get('magic'), 0):,}",
-                        "魔力值",
-                    ),
-                ],
-            },
-            {
-                "component": "VRow",
-                "props": {"class": "mb-4"},
-                "content": [
-                    self.__tile("🔁", f"{self._max_casts_per_run}次", "单次抛竿"),
-                    self.__tile(
-                        "🎯",
-                        f"{max(0, attempts_limit - attempts_used)}次",
-                        "今日剩余",
-                    ),
-                    self.__tile(
-                        "✨", f"{self.__safe_int(daily.get('new_discoveries'), 0)}种", "今日新发现"
-                    ),
-                    self.__tile(
-                        "💸", f"{self.__safe_int(daily.get('spent'), 0)}", "今日购饵花费"
-                    ),
-                ],
-            },
+            self.__today_overview_card(),
             self.__quick_actions_card(),
             self.__strategy_tuning_card(),
             self.__lure_table(lures, selected_lure),
@@ -1009,12 +1004,7 @@ class SiQiFishingV3(_PluginBase):
                                 if self._auto_guess
                                 else "不自动竞猜",
                             ),
-                            self.__strategy_row(
-                                "时段分散",
-                                f"每时段最多 {self._per_slot_casts} 次"
-                                if self._slot_spread
-                                else "不限制时段",
-                            ),
+                            self.__strategy_row("时段分配", slot_info),
                             self.__strategy_row(
                                 "演练模式", "开启（只同步不抛竿）" if self._dry_run else "关闭"
                             ),
@@ -1091,16 +1081,30 @@ class SiQiFishingV3(_PluginBase):
         params: Optional[Dict[str, Any]] = None,
         *,
         method: str = "post",
-        color: str = "primary",
-        variant: str = "tonal",
-        size: str = "small",
+        selected: bool = False,
+        danger: bool = False,
         disabled: bool = False,
+        color: Optional[str] = None,
+        variant: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """构造带点击事件的 VBtn；点击后由宿主调用插件 API 并自动刷新页面。"""
+        """构造四态 VBtn 并绑定插件 API。
+
+        选中用 flat/primary，未选中用 outlined/#475569，禁用用 outlined/#6b7280，
+        危险动作用 tonal/error；仅同步、交付等动作可用 color/variant 指定强调色。
+        """
+        if disabled:
+            variant, color = "outlined", "#6b7280"
+        elif danger:
+            variant, color = "tonal", "error"
+        elif selected:
+            variant, color = "flat", "primary"
+        else:
+            variant = variant or "outlined"
+            color = color or "#475569"
         return {
             "component": "VBtn",
             "props": {
-                "size": size,
+                "size": "small",
                 "variant": variant,
                 "color": color,
                 "disabled": bool(disabled),
@@ -1117,50 +1121,48 @@ class SiQiFishingV3(_PluginBase):
         }
 
     def __option_row(
-        self, label: str, value_text: str, buttons: List[dict]
+        self,
+        label: str,
+        value_text: str,
+        buttons: List[dict],
+        *,
+        last: bool = False,
     ) -> Dict[str, Any]:
-        """构造一行「名称 + 当前值 + 按钮组」的选项行。"""
+        """构造一行「名称 + 当前值 chip + 右对齐按钮组」的选项行。"""
+        row_style = (
+            "display:flex; align-items:center; gap:8px; flex-wrap:wrap;"
+            " padding:9px 0;"
+        )
+        if not last:
+            row_style += " border-bottom:1px dashed rgba(148,163,184,0.25);"
         return {
             "component": "div",
-            "props": {
-                "style": (
-                    "display:flex; align-items:center; gap:10px; flex-wrap:wrap;"
-                    " padding:8px 0; border-bottom:1px dashed rgba(148,163,184,0.25);"
-                    " font-size:13px;"
-                )
-            },
+            "props": {"style": row_style},
             "content": [
                 {
-                    "component": "div",
+                    "component": "span",
                     "props": {
                         "style": (
-                            "display:flex; align-items:center; gap:8px;"
-                            " flex:1 1 160px; min-width:0;"
+                            "flex:0 0 118px; font-size:13px; color:#334155;"
                         )
                     },
-                    "content": [
-                        {
-                            "component": "span",
-                            "props": {"style": "opacity:0.75;"},
-                            "text": label,
-                        },
-                        {
-                            "component": "VChip",
-                            "props": {
-                                "size": "x-small",
-                                "variant": "tonal",
-                                "color": "primary",
-                            },
-                            "text": value_text,
-                        },
-                    ],
+                    "text": label,
+                },
+                {
+                    "component": "VChip",
+                    "props": {
+                        "size": "x-small",
+                        "variant": "tonal",
+                        "color": "primary",
+                    },
+                    "text": value_text,
                 },
                 {
                     "component": "div",
                     "props": {
                         "style": (
-                            "display:flex; align-items:center; gap:6px; flex-wrap:wrap;"
-                            " justify-content:flex-end;"
+                            "margin-left:auto; display:flex; flex-wrap:wrap;"
+                            " gap:6px; justify-content:flex-end;"
                         )
                     },
                     "content": buttons,
@@ -1178,6 +1180,7 @@ class SiQiFishingV3(_PluginBase):
         off_text: str,
         on_color: str = "warning",
         off_color: str = "success",
+        last: bool = False,
     ) -> Dict[str, Any]:
         """构造开关行：展示当前状态，按钮用于切到相反状态。"""
         return self.__option_row(
@@ -1189,9 +1192,20 @@ class SiQiFishingV3(_PluginBase):
                     "set_option",
                     {"key": key, "value": not enabled},
                     color=off_color if enabled else on_color,
+                    variant="tonal",
                 )
             ],
+            last=last,
         )
+
+    @staticmethod
+    def __dead_span(text: str) -> Dict[str, Any]:
+        """不可点击项（零库存鱼饵、未解锁鱼竿）降级为灰色原生 span。"""
+        return {
+            "component": "span",
+            "props": {"style": "color:#6b7280;font-size:12px;padding:4px 6px;"},
+            "text": text,
+        }
 
     def __running_chip(self) -> Optional[Dict[str, Any]]:
         """锁被占用时返回「任务执行中」徽标，空闲返回 None。"""
@@ -1212,20 +1226,16 @@ class SiQiFishingV3(_PluginBase):
         """快捷操作卡：同步钓 1 竿、后台跑满一轮、仅同步、交付任务。"""
         state = self._state or {}
         ready = max(0, self.__safe_int(state.get("tasks_ready"), 0))
-        quick_limit = min(
-            self.MAX_QUICK_CASTS,
-            max(1, self.__safe_int(self._max_casts_per_run, 1, min_value=1)),
-        )
         rows = [
             self.__option_row(
                 "🎣 钓 1 竿",
-                f"最多 {quick_limit} 竿",
+                "单次 1 竿",
                 [
                     self.__btn(
                         "演练中·仅同步" if self._dry_run else "🎣 钓 1 竿",
                         "fish_now",
                         {"casts": 1},
-                        color="primary",
+                        danger=not self._dry_run,
                         disabled=self._dry_run,
                     )
                 ],
@@ -1238,7 +1248,7 @@ class SiQiFishingV3(_PluginBase):
                         "⏱ 后台钓满一轮",
                         "run",
                         {},
-                        color="secondary",
+                        danger=True,
                     )
                 ],
             ),
@@ -1251,6 +1261,7 @@ class SiQiFishingV3(_PluginBase):
                         "sync",
                         {},
                         color="info",
+                        variant="tonal",
                     )
                 ],
             ),
@@ -1263,9 +1274,11 @@ class SiQiFishingV3(_PluginBase):
                         "deliver",
                         {},
                         color="success",
+                        variant="tonal",
                         disabled=ready == 0,
                     )
                 ],
+                last=True,
             ),
         ]
         return {
@@ -1316,9 +1329,23 @@ class SiQiFishingV3(_PluginBase):
                 {"perfect": "完美 0.50", "range": "甜蜜区随机", "custom": "自定义"}[mode],
                 "set_option",
                 {"key": "slider_mode", "value": mode},
-                disabled=self._slider_mode == mode,
+                selected=self._slider_mode == mode,
             )
             for mode in ("perfect", "range", "custom")
+        ]
+
+        slot_text = {
+            "auto": "自动平均",
+            "manual": f"手动 {self._per_slot_casts} 次",
+        }.get(self._slot_strategy, "关闭")
+        slot_buttons = [
+            self.__btn(
+                {"auto": "自动", "manual": "手动", "off": "关闭"}[mode],
+                "set_option",
+                {"key": "slot_strategy", "value": mode},
+                selected=self._slot_strategy == mode,
+            )
+            for mode in ("auto", "manual", "off")
         ]
 
         selected_lure = state.get("selected_lure") or ""
@@ -1332,19 +1359,22 @@ class SiQiFishingV3(_PluginBase):
                 "自动",
                 "set_option",
                 {"key": "lure_mode", "value": "auto"},
-                color="secondary",
-                disabled=self._lure_mode == "auto",
+                selected=self._lure_mode == "auto",
             )
         ]
         for key, meta in self.LURE_META.items():
             stock = max(0, self.__safe_int(lures.get(key), 0))
-            chosen = self._lure_mode == "fixed" and self._lure_key == key
+            if stock <= 0:
+                lure_buttons.append(
+                    self.__dead_span(f"∅ {meta['icon']} {meta['name']}")
+                )
+                continue
             lure_buttons.append(
                 self.__btn(
-                    f"{meta['icon']} {meta['name']}" + ("(库存0)" if stock <= 0 else ""),
+                    f"{meta['icon']} {meta['name']}",
                     "set_option",
                     {"key": "lure_fixed", "value": key},
-                    disabled=chosen or stock <= 0,
+                    selected=self._lure_mode == "fixed" and self._lure_key == key,
                 )
             )
 
@@ -1358,27 +1388,19 @@ class SiQiFishingV3(_PluginBase):
                 "自动",
                 "set_option",
                 {"key": "rod_mode", "value": "auto"},
-                color="secondary",
-                disabled=self._rod_mode == "auto",
+                selected=self._rod_mode == "auto",
             )
         ]
         for key, meta in self.ROD_META.items():
             if not self.__rod_unlocked(key):
-                rod_buttons.append(
-                    {
-                        "component": "span",
-                        "props": {"style": "font-size:12px; opacity:0.6;"},
-                        "text": f"🔒 {meta['name']}",
-                    }
-                )
+                rod_buttons.append(self.__dead_span(f"🔒 {meta['name']}"))
                 continue
-            chosen = self._rod_mode == "fixed" and self._rod_key == key
             rod_buttons.append(
                 self.__btn(
                     f"{meta['icon']} {meta['name']}",
                     "set_option",
                     {"key": "rod_fixed", "value": key},
-                    disabled=chosen,
+                    selected=self._rod_mode == "fixed" and self._rod_key == key,
                 )
             )
 
@@ -1387,7 +1409,7 @@ class SiQiFishingV3(_PluginBase):
                 f"{amount}",
                 "set_option",
                 {"key": "buy_budget_per_day", "value": amount},
-                disabled=self._buy_budget_per_day == amount,
+                selected=self._buy_budget_per_day == amount,
             )
             for amount in (0, 5000, 20000)
         ]
@@ -1398,7 +1420,7 @@ class SiQiFishingV3(_PluginBase):
                 f"{amount}",
                 "set_option",
                 {"key": "keep_lures", "value": amount},
-                disabled=self._keep_lures == amount,
+                selected=self._keep_lures == amount,
             )
             for amount in (10, 20, 50)
         ]
@@ -1409,16 +1431,24 @@ class SiQiFishingV3(_PluginBase):
                 f"{amount}",
                 "set_option",
                 {"key": "daily_cast_limit", "value": amount},
-                disabled=self._daily_cast_limit == amount,
+                selected=self._daily_cast_limit == amount,
             )
             for amount in (6, 12, 24, 33)
         ]
         daily_buttons.append(self.__hint_span("自定义数值请进配置页"))
 
-        rows = [
+        cast_rows = [
             self.__option_row("收竿方式", slider_text, slider_buttons),
+            self.__option_row("时段分配", slot_text, slot_buttons),
+            self.__option_row(
+                "每日抛竿上限", f"{self._daily_cast_limit} 次", daily_buttons
+            ),
+            self.__option_row(
+                "单次抛竿", f"{self._max_casts_per_run} 竿", [], last=True
+            ),
+        ]
+        lure_rows = [
             self.__option_row("鱼饵策略", lure_text, lure_buttons),
-            self.__option_row("鱼竿策略", rod_text, rod_buttons),
             self.__toggle_row(
                 "自动补饵",
                 "auto_buy",
@@ -1429,10 +1459,14 @@ class SiQiFishingV3(_PluginBase):
             self.__option_row(
                 "每日购饵预算", f"{self._buy_budget_per_day} 魔力", budget_buttons
             ),
-            self.__option_row("鱼饵保底库存", f"{self._keep_lures} 枚", keep_buttons),
             self.__option_row(
-                "每日抛竿上限", f"{self._daily_cast_limit} 次", daily_buttons
+                "鱼饵保底库存", f"{self._keep_lures} 枚", keep_buttons, last=True
             ),
+        ]
+        rod_rows = [
+            self.__option_row("鱼竿策略", rod_text, rod_buttons, last=True),
+        ]
+        auto_rows = [
             self.__toggle_row(
                 "演练模式",
                 "dry_run",
@@ -1453,13 +1487,7 @@ class SiQiFishingV3(_PluginBase):
                 self._auto_guess,
                 on_text="开启自动竞猜",
                 off_text="关闭自动竞猜",
-            ),
-            self.__toggle_row(
-                "时段分散",
-                "slot_spread",
-                self._slot_spread,
-                on_text="开启时段分散",
-                off_text="关闭时段分散",
+                last=True,
             ),
         ]
         return {
@@ -1483,7 +1511,53 @@ class SiQiFishingV3(_PluginBase):
                         },
                     ],
                 },
-                {"component": "VCardText", "content": rows},
+                {
+                    "component": "VCardText",
+                    "content": [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        self.__tuning_section("🎣 投放", cast_rows),
+                                        self.__tuning_section("🪝 鱼竿", rod_rows),
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        self.__tuning_section("🪱 鱼饵", lure_rows),
+                                        self.__tuning_section("🤖 自动化", auto_rows),
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                },
+            ],
+        }
+
+    @staticmethod
+    def __tuning_section(title: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """构造策略调节的子区块：小标题 + 若干选项行。"""
+        return {
+            "component": "div",
+            "props": {"style": "margin-bottom:16px;"},
+            "content": [
+                {
+                    "component": "span",
+                    "props": {
+                        "style": (
+                            "display:block; font-size:14px; font-weight:700;"
+                            " color:#334155; margin-bottom:6px;"
+                        )
+                    },
+                    "text": title,
+                },
+                *rows,
             ],
         }
 
@@ -1498,33 +1572,27 @@ class SiQiFishingV3(_PluginBase):
 
     def __hero_card(
         self,
-        catches: int,
-        attempt_text: str,
+        remaining: int,
+        daily_casts: int,
+        daily_limit: int,
+        site_limit: int,
+        lure_total: int,
         schedule_info: str,
         updated_at: str,
         last_result: str,
     ) -> Dict[str, Any]:
+        """Hero 卡：今日剩余次数、已钓/上限副行、调度与鱼饵 pills。"""
+        pill_style = (
+            "display:inline-block; padding:2px 10px; border-radius:999px;"
+            " background: rgba(255,255,255,0.18); font-size:12px;"
+            " margin-right:6px;"
+        )
         pills = [
+            {"component": "span", "props": {"style": pill_style}, "text": f"⏱ {schedule_info}"},
             {
                 "component": "span",
-                "props": {
-                    "style": (
-                        "display:inline-block; padding:2px 10px; border-radius:999px;"
-                        " background: rgba(255,255,255,0.18); font-size:12px;"
-                        " margin-right:6px;"
-                    )
-                },
-                "text": f"⏱ {schedule_info}",
-            },
-            {
-                "component": "span",
-                "props": {
-                    "style": (
-                        "display:inline-block; padding:2px 10px; border-radius:999px;"
-                        " background: rgba(255,255,255,0.18); font-size:12px;"
-                    )
-                },
-                "text": f"🎣 今日次数 {attempt_text}",
+                "props": {"style": pill_style},
+                "text": f"🪱 鱼饵 {lure_total:,} 枚",
             },
         ]
         if self._dry_run:
@@ -1535,7 +1603,6 @@ class SiQiFishingV3(_PluginBase):
                         "style": (
                             "display:inline-block; padding:2px 10px; border-radius:999px;"
                             " background: rgba(255, 193, 7, 0.3); font-size:12px;"
-                            " margin-left:6px;"
                         )
                     },
                     "text": "演练模式",
@@ -1556,21 +1623,21 @@ class SiQiFishingV3(_PluginBase):
             },
             {
                 "component": "div",
-                "props": {
-                    "style": "display:flex; align-items:baseline; gap:10px; margin:6px 0 10px 0;"
-                },
-                "content": [
-                    {
-                        "component": "div",
-                        "props": {"style": "font-size: 44px; font-weight: 800; line-height: 1;"},
-                        "text": f"{catches:,}条",
-                    },
-                    {
-                        "component": "div",
-                        "props": {"style": "font-size: 14px; opacity: 0.85;"},
-                        "text": "今日已钓",
-                    },
-                ],
+                "props": {"style": "font-size: 13px; opacity: 0.9; margin-top: 8px;"},
+                "text": "今日剩余次数",
+            },
+            {
+                "component": "div",
+                "props": {"style": "font-size: 44px; font-weight: 800; line-height: 1.1;"},
+                "text": f"{max(0, remaining)}次",
+            },
+            {
+                "component": "div",
+                "props": {"style": "font-size: 13px; opacity: 0.9; margin: 4px 0 10px 0;"},
+                "text": (
+                    f"已钓 {daily_casts} · 上限 {daily_limit}"
+                    f"（站点 {site_limit or '?'}）"
+                ),
             },
             {"component": "div", "props": {"style": "margin-bottom:8px;"}, "content": pills},
             {
@@ -1601,16 +1668,47 @@ class SiQiFishingV3(_PluginBase):
             "content": content,
         }
 
-    def __attempt_progress_card(self, used: int, limit: int) -> Dict[str, Any]:
-        ratio = 0.0
-        if limit > 0:
-            ratio = min(1.0, max(0.0, used / limit))
-        percent = int(round(ratio * 100))
-        color = "#22c55e"
+    def __today_overview_card(self) -> Dict[str, Any]:
+        """今日概览卡：进度条、四瓦片、摘要行与 6 格时段网格。"""
+        state = self._state or {}
+        daily = self._daily or {}
+
+        site_limit = max(0, self.__safe_int(state.get("attempts_limit"), 0))
+        site_used = max(0, self.__safe_int(state.get("attempts_used"), 0))
+        daily_casts = max(0, self.__safe_int(daily.get("casts"), 0))
+        limit = self.__effective_limit(self._daily_cast_limit, site_limit)
+        used = site_used if site_limit > 0 else daily_casts
+        percent = int(round(min(1.0, max(0.0, used / limit)) * 100)) if limit > 0 else 0
+        bar_color = "#22c55e"
         if percent >= 90:
-            color = "#ef4444"
+            bar_color = "#ef4444"
         elif percent >= 60:
-            color = "#f59e0b"
+            bar_color = "#f59e0b"
+
+        slot_no = self.__time_slot(datetime.now(self.TZ_CN).hour)
+        slot_strategy = self._slot_strategy
+        slot_left = self.__slots_left(slot_no)
+        slot_remaining = self.__remaining_casts(
+            site_used, site_limit, daily_casts, self._daily_cast_limit
+        )
+        quota = self.__slot_quota(slot_remaining, slot_left)
+        slots = daily.get("slots") if isinstance(daily.get("slots"), dict) else {}
+        if slot_strategy == "auto":
+            slot_summary = (
+                f"自动分配：剩余 {slot_remaining} 次 ÷ {slot_left} 时段"
+                f" ≈ {quota} 竿/时段（含当前）"
+            )
+        elif slot_strategy == "manual":
+            slot_summary = f"手动：每时段 {self._per_slot_casts} 次（配置页修改）"
+        else:
+            slot_summary = "不限时段"
+
+        lure_total = sum(
+            max(0, self.__safe_int(v, 0))
+            for v in (state.get("lures") or {}).values()
+            if isinstance(v, (int, float))
+        )
+
         return {
             "component": "VCard",
             "props": {"variant": "outlined", "class": "mb-4"},
@@ -1619,11 +1717,15 @@ class SiQiFishingV3(_PluginBase):
                     "component": "VCardTitle",
                     "props": {"class": "d-flex align-center"},
                     "content": [
-                        {"component": "span", "text": "🎯 今日抛竿进度"},
+                        {"component": "span", "text": "📊 今日概览"},
                         {"component": "VSpacer"},
                         {
                             "component": "VChip",
-                            "props": {"size": "small", "variant": "tonal", "color": "primary"},
+                            "props": {
+                                "size": "small",
+                                "variant": "tonal",
+                                "color": "primary",
+                            },
                             "text": f"{used} / {limit or '?'}",
                         },
                     ],
@@ -1645,19 +1747,60 @@ class SiQiFishingV3(_PluginBase):
                                     "props": {
                                         "style": (
                                             f"height: 100%; width: {percent}%;"
-                                            f" background: {color}; border-radius: 999px;"
+                                            f" background: {bar_color}; border-radius: 999px;"
                                         )
                                     },
                                 }
                             ],
                         },
                         {
+                            "component": "VRow",
+                            "props": {"class": "mt-3"},
+                            "content": [
+                                self.__tile(
+                                    "🎣",
+                                    f"{max(0, self.__safe_int(state.get('catches'), 0)):,}条",
+                                    "今日渔获",
+                                ),
+                                self.__tile("🪱", f"{lure_total:,}枚", "鱼饵库存"),
+                                self.__tile(
+                                    "📖",
+                                    f"{max(0, self.__safe_int(state.get('codex_unlocked'), 0))}"
+                                    f"/{max(0, self.__safe_int(state.get('codex_total'), 0)) or '?'}",
+                                    "图鉴解锁",
+                                ),
+                                self.__tile(
+                                    "💰",
+                                    f"{self.__safe_int(state.get('magic'), 0):,}",
+                                    "魔力值",
+                                ),
+                            ],
+                        },
+                        {
                             "component": "div",
-                            "props": {"style": "font-size: 12px; opacity: 0.75; margin-top: 8px;"},
+                            "props": {"style": "font-size:12px; color:#6b7280;"},
                             "text": (
-                                f"已用 {used} 次，剩余 {max(0, limit - used)} 次；"
-                                f"每日次数于 GMT+8 00:00 重置。"
+                                f"单次 {self._max_casts_per_run} 竿 · "
+                                f"新发现 {max(0, self.__safe_int(daily.get('new_discoveries'), 0))} 种 · "
+                                f"购饵花费 {max(0, self.__safe_int(daily.get('spent'), 0))}"
                             ),
+                        },
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": (
+                                    "display:grid; grid-template-columns:repeat(auto-fit,minmax(72px,1fr));"
+                                    " gap:6px; margin-top:10px;"
+                                )
+                            },
+                            "content": self.__slot_grid(
+                                slots, slot_no, slot_strategy, self._per_slot_casts, quota
+                            ),
+                        },
+                        {
+                            "component": "div",
+                            "props": {"style": "font-size:12px; color:#6b7280; margin-top:8px;"},
+                            "text": slot_summary,
                         },
                     ],
                 },
@@ -2218,22 +2361,22 @@ class SiQiFishingV3(_PluginBase):
         failure = ""
 
         while casts < cast_limit:
-            # 每竿重算时段，避免跨 4 小时边界后仍记在旧时段
-            slot_now = str(self.__time_slot(datetime.now(self.TZ_CN).hour))
+            # 每竿重算日期与时段，避免跨日或跨 4 小时边界后仍挂在旧配额上
+            now = datetime.now(self.TZ_CN)
+            today = now.strftime("%Y-%m-%d")
+            if self._daily.get("date") != today:
+                self._daily = self.__roll_daily(self._daily, today)
             if not isinstance(self._daily.get("slots"), dict):
                 self._daily["slots"] = {}
+            slot_no = self.__time_slot(now.hour)
+            slot_now = str(slot_no)
             slots = self._daily["slots"]
             slot_used = self.__safe_int(slots.get(slot_now), 0)
+            daily_casts = self.__safe_int(self._daily.get("casts"), 0)
             attempts_limit = self.__safe_int(self._state.get("attempts_limit"), 0)
             attempts_used = self.__safe_int(self._state.get("attempts_used"), 0)
-            # 站点次数未知（limit<=0）时不作为约束
-            site_remaining = (
-                max(0, attempts_limit - attempts_used)
-                if attempts_limit > 0
-                else self.MAX_DAILY_CASTS
-            )
-            # 依次检查：插件日限、站点剩余、时段分散，任一耗尽即停止
-            if self._daily["casts"] >= self._daily_cast_limit:
+            # 依次检查：插件日限、站点次数，任一耗尽即停止
+            if daily_casts >= self._daily_cast_limit:
                 status = "partial"
                 failure = "已达插件每日上限"
                 break
@@ -2241,21 +2384,23 @@ class SiQiFishingV3(_PluginBase):
                 status = "partial"
                 failure = "站点今日次数已用完"
                 break
-            if self._slot_spread and slot_used >= self._per_slot_casts:
-                status = "partial"
-                failure = "本时段已达上限"
-                break
-            allowed = self.__allowed_casts(
-                cast_limit - casts,
-                self._daily["casts"],
-                self._daily_cast_limit,
-                slot_used if self._slot_spread else 0,
-                self._per_slot_casts if self._slot_spread else self.MAX_DAILY_CASTS,
-                site_remaining,
+
+            allowed = self.__plan_slot_casts(
+                strategy=self._slot_strategy,
+                site_used=attempts_used,
+                site_limit=attempts_limit,
+                plugin_casts=daily_casts,
+                daily_limit=self._daily_cast_limit,
+                slot=slot_no,
+                slot_used=slot_used,
+                per_slot=self._per_slot_casts,
+                max_per_run=cast_limit - casts,
             )
             if allowed <= 0:
                 status = "partial"
-                failure = "可用次数不足"
+                failure = self.__slot_exhausted_reason(
+                    attempts_used, attempts_limit, daily_casts, slot_no, slot_used
+                )
                 break
 
             lure_key = self._state.get("selected_lure")
@@ -2322,10 +2467,11 @@ class SiQiFishingV3(_PluginBase):
             if wait > 0:
                 await asyncio.sleep(wait)
 
-        remaining = max(
-            0,
-            self.__safe_int(self._state.get("attempts_limit"), 0)
-            - self.__safe_int(self._state.get("attempts_used"), 0),
+        remaining = self.__remaining_casts(
+            self.__safe_int(self._state.get("attempts_used"), 0),
+            self.__safe_int(self._state.get("attempts_limit"), 0),
+            self.__safe_int(self._daily.get("casts"), 0),
+            self._daily_cast_limit,
         )
         if casts == 0 and status == "completed":
             status = "partial"
@@ -2726,6 +2872,183 @@ class SiQiFishingV3(_PluginBase):
             SiQiFishingV3.__safe_int(site_remaining, 0),
         ]
         return max(0, min(limits))
+
+    @staticmethod
+    def __slot_quota(remaining: int, slots_left: int) -> int:
+        """按剩余次数与剩余时段数平均分配，向上取整；不足 1 段时按 1 段算。"""
+        remaining = max(0, SiQiFishingV3.__safe_int(remaining, 0))
+        slots_left = max(1, SiQiFishingV3.__safe_int(slots_left, 0))
+        if remaining <= 0:
+            return 0
+        return -(-remaining // slots_left)
+
+    @staticmethod
+    def __slots_left(slot: int) -> int:
+        """返回含当前时段在内的剩余时段数（1~6）。"""
+        slot = SiQiFishingV3.__safe_int(slot, 1)
+        return min(6, max(1, 7 - slot))
+
+    @staticmethod
+    def __effective_limit(daily_limit: int, site_limit: int) -> int:
+        """插件日限与站点日限取较小值；站点未给出上限时只用插件日限。"""
+        daily_limit = max(0, SiQiFishingV3.__safe_int(daily_limit, 0))
+        site_limit = SiQiFishingV3.__safe_int(site_limit, 0)
+        if site_limit <= 0:
+            return daily_limit
+        return min(daily_limit, site_limit)
+
+    @staticmethod
+    def __remaining_casts(
+        site_used: int, site_limit: int, plugin_casts: int, daily_limit: int
+    ) -> int:
+        """计算今日还能抛几竿：站点给出上限时以站点口径为准，否则按插件自身计数算。"""
+        site_limit = SiQiFishingV3.__safe_int(site_limit, 0)
+        if site_limit > 0:
+            return max(
+                0, site_limit - SiQiFishingV3.__safe_int(site_used, 0)
+            )
+        return max(
+            0,
+            SiQiFishingV3.__safe_int(daily_limit, 0)
+            - SiQiFishingV3.__safe_int(plugin_casts, 0),
+        )
+
+    @staticmethod
+    def __plan_slot_casts(
+        *,
+        strategy: str,
+        site_used: int,
+        site_limit: int,
+        plugin_casts: int,
+        daily_limit: int,
+        slot: int,
+        slot_used: int,
+        per_slot: int,
+        max_per_run: int,
+    ) -> int:
+        """计算本时段本轮还能抛几竿：时段配额先减已用，再与单轮、剩余、日限取最小值。"""
+        remaining = SiQiFishingV3.__remaining_casts(
+            site_used, site_limit, plugin_casts, daily_limit
+        )
+        slot_used = max(0, SiQiFishingV3.__safe_int(slot_used, 0))
+        if strategy == "auto":
+            cap = (
+                SiQiFishingV3.__slot_quota(
+                    remaining, SiQiFishingV3.__slots_left(slot)
+                )
+                - slot_used
+            )
+        elif strategy == "manual":
+            cap = SiQiFishingV3.__safe_int(per_slot, 0) - slot_used
+        else:
+            cap = SiQiFishingV3.MAX_DAILY_CASTS
+        daily_remaining = max(
+            0,
+            SiQiFishingV3.__safe_int(daily_limit, 0)
+            - SiQiFishingV3.__safe_int(plugin_casts, 0),
+        )
+        return max(
+            0,
+            min(
+                cap,
+                SiQiFishingV3.__safe_int(max_per_run, 0),
+                remaining,
+                daily_remaining,
+            ),
+        )
+
+    def __slot_exhausted_reason(
+        self,
+        site_used: int,
+        site_limit: int,
+        plugin_casts: int,
+        slot: int,
+        slot_used: int,
+    ) -> str:
+        """时段配额耗尽时的停止原因：配额分母复用同一套推导，避免与限流逻辑漂移。"""
+        slot_used = max(0, self.__safe_int(slot_used, 0))
+        if self._slot_strategy == "auto":
+            cap = self.__slot_quota(
+                self.__remaining_casts(
+                    site_used, site_limit, plugin_casts, self._daily_cast_limit
+                ),
+                self.__slots_left(slot),
+            )
+            return f"本时段配额已用完（{slot_used}/{cap}），下一时段自动恢复"
+        if self._slot_strategy == "manual":
+            cap = max(0, self.__safe_int(self._per_slot_casts, 0))
+            return f"本时段配额已用完（{slot_used}/{cap}），下一时段自动恢复"
+        return f"本时段配额已用完（已用 {slot_used} 竿），下一时段自动恢复"
+
+    @staticmethod
+    def __slot_grid(
+        slots: Dict[str, Any],
+        current_slot: int,
+        strategy: str,
+        per_slot: int,
+        quota: int,
+    ) -> List[Dict[str, Any]]:
+        """返回 6 个时段格子的 div 节点：过去为实际竿数，当前为 used/cap，未来为占位。"""
+        slots = slots if isinstance(slots, dict) else {}
+        current = min(6, max(1, SiQiFishingV3.__safe_int(current_slot, 1)))
+        if strategy == "auto":
+            cap_text = str(max(0, SiQiFishingV3.__safe_int(quota, 0)))
+        elif strategy == "manual":
+            cap_text = str(max(0, SiQiFishingV3.__safe_int(per_slot, 0)))
+        else:
+            cap_text = "–"
+        base = (
+            "border-radius:8px; padding:6px 2px; text-align:center;"
+            " font-size:11px; line-height:1.5;"
+        )
+        cells: List[Dict[str, Any]] = []
+        for index in range(1, 7):
+            used = max(0, SiQiFishingV3.__safe_int(slots.get(str(index)), 0))
+            if index < current:
+                cells.append(
+                    {
+                        "component": "div",
+                        "props": {
+                            "style": base
+                            + "background:rgba(148,163,184,0.15); color:#6b7280;"
+                        },
+                        "text": f"{used}竿",
+                    }
+                )
+            elif index == current:
+                cells.append(
+                    {
+                        "component": "div",
+                        "props": {
+                            "style": base
+                            + "background:rgba(37,99,235,0.12); border:1px solid #2563eb;"
+                            " color:#1d4ed8; font-weight:700;"
+                        },
+                        "content": [
+                            {
+                                "component": "div",
+                                "text": f"▶ 时段{index}",
+                            },
+                            {
+                                "component": "div",
+                                "text": f"{used}/{cap_text}",
+                            },
+                        ],
+                    }
+                )
+            else:
+                cells.append(
+                    {
+                        "component": "div",
+                        "props": {
+                            "style": base
+                            + "background:rgba(148,163,184,0.06);"
+                            " border:1px dashed rgba(148,163,184,0.45); color:#6b7280;"
+                        },
+                        "text": "–",
+                    }
+                )
+        return cells
 
     @staticmethod
     def __buy_quantity(
