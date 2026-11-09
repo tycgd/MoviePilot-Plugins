@@ -25,7 +25,7 @@ class SiQiRestaurantV3(_PluginBase):
     plugin_name = "思齐开餐馆"
     plugin_desc = "思齐站点开餐馆小游戏自动化：自动开店、按顾客需求采购食材与上菜、员工雇佣、每日下馆子，策略全部可配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqirestaurantv3_"
@@ -47,9 +47,12 @@ class SiQiRestaurantV3(_PluginBase):
     POLL_SECONDS = 3
     MAX_QUICK_SERVES = 3
 
-    # 上菜节奏拟真化：在按烹饪时间/灶台数计算的基准上叠加随机抖动，
+    # 上菜节奏拟真化：每单 = 烹饪时间/灶台数 + 拖拽食材随机 + 上菜随机，
     # 并为采购、下馆子、雇佣等操作加入短间隔，避免瞬间完成全部顾客。
-    SERVE_JITTER_MAX = 1.2
+    PREP_DELAY_MIN = 1.5
+    PREP_DELAY_MAX = 3.0
+    PLATE_DELAY_MIN = 2.0
+    PLATE_DELAY_MAX = 4.0
     ACTION_DELAY_MIN = 0.25
     ACTION_DELAY_MAX = 0.6
 
@@ -558,7 +561,7 @@ class SiQiRestaurantV3(_PluginBase):
                                         "type": "number",
                                         "min": 0,
                                         "max": 600,
-                                        "hint": "下限，实际按菜品烹饪时间与灶台数计算",
+                                        "hint": "下限；实际每单 = 菜品烹饪时间÷灶台数 + 拖拽食材1.5~3s + 上菜2~4s",
                                     },
                                 },
                             ),
@@ -1869,14 +1872,16 @@ class SiQiRestaurantV3(_PluginBase):
         logger.warning(f"思齐开餐馆：开店未成功：{message}")
 
     def __serve_delay(self, dish: Dict[str, Any]) -> float:
-        """按菜品烹饪时间与已解锁灶台数模拟并行烹饪，并加随机抖动。"""
+        """每单拟真耗时 = 烹饪(实际cook_time/灶台数) + 拖拽食材(1.5~3s) + 上菜(2~4s)。"""
         cook = float(dish.get("cook_time") or 0)
         stations = max(
             1,
             self.__safe_int((self._state.get("unlocked") or {}).get("stations"), 1),
         )
         base = max(float(self._min_serve_delay_seconds), cook / stations)
-        return min(120.0, max(0.0, base + random.uniform(0, self.SERVE_JITTER_MAX)))
+        prep = random.uniform(self.PREP_DELAY_MIN, self.PREP_DELAY_MAX)
+        plate = random.uniform(self.PLATE_DELAY_MIN, self.PLATE_DELAY_MAX)
+        return min(240.0, max(0.0, base + prep + plate))
 
     async def __serve_loop(
         self,

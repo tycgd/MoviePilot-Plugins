@@ -428,7 +428,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqirestaurantv3"
-    assert cls.plugin_version == "1.0.1"
+    assert cls.plugin_version == "1.0.2"
     assert cls.plugin_config_prefix == "siqirestaurantv3_"
     assert cls.plugin_order == 32
     assert cls.plugin_author == "tycgd"
@@ -451,7 +451,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.0.1"
+    assert cls.plugin_version == "1.0.2"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1083,8 +1083,8 @@ def test_min_serve_delay_sleep(monkeypatch):
     stations = max(1, plugin._state["unlocked"]["stations"])
     floor = max(plugin._min_serve_delay_seconds, float(dish.get("cook_time") or 0) / stations)
     for delay in sleeps:
-        assert delay >= floor
-        assert delay <= 120
+        assert delay >= floor + plugin.PREP_DELAY_MIN + plugin.PLATE_DELAY_MIN
+        assert delay <= 240
 
 
 def test_serve_delay_uses_cook_time_over_stations(monkeypatch):
@@ -1093,10 +1093,11 @@ def test_serve_delay_uses_cook_time_over_stations(monkeypatch):
     plugin = build_plugin(module)
     plugin._min_serve_delay_seconds = 0
     plugin._state["unlocked"] = {"stations": 2}
-    monkeypatch.setattr(module.SiQiRestaurantV3, "SERVE_JITTER_MAX", 0)
+    monkeypatch.setattr(module.random, "uniform", lambda a, b: a)
     serve_delay = getattr(plugin, "_SiQiRestaurantV3__serve_delay")
 
-    assert serve_delay({"cook_time": 8}) == 4.0
+    # 烹饪 8/2=4，拖拽 1.5，上菜 2 → 7.5
+    assert serve_delay({"cook_time": 8}) == 7.5
 
 
 def test_serve_delay_floor_min(monkeypatch):
@@ -1105,10 +1106,36 @@ def test_serve_delay_floor_min(monkeypatch):
     plugin = build_plugin(module)
     plugin._min_serve_delay_seconds = 5
     plugin._state["unlocked"] = {"stations": 1}
-    monkeypatch.setattr(module.SiQiRestaurantV3, "SERVE_JITTER_MAX", 0)
+    monkeypatch.setattr(module.random, "uniform", lambda a, b: a)
     serve_delay = getattr(plugin, "_SiQiRestaurantV3__serve_delay")
 
-    assert serve_delay({"cook_time": 4}) >= 5
+    # 下限 5 + 拖拽 1.5 + 上菜 2 = 8.5
+    assert serve_delay({"cook_time": 4}) >= 8.5
+
+
+def test_serve_delay_includes_prep_and_plate(monkeypatch):
+    """拖拽食材与上菜取上界：cook=4/1 灶 → 4+3+4=11。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._min_serve_delay_seconds = 0
+    plugin._state["unlocked"] = {"stations": 1}
+    monkeypatch.setattr(module.random, "uniform", lambda a, b: b)
+    serve_delay = getattr(plugin, "_SiQiRestaurantV3__serve_delay")
+
+    assert serve_delay({"cook_time": 4}) == 11.0
+
+
+def test_serve_delay_varies_with_cook_time(monkeypatch):
+    """同灶台、同随机下，cook_time 9 与 4 的延迟差约 5 秒。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._min_serve_delay_seconds = 0
+    plugin._state["unlocked"] = {"stations": 1}
+    monkeypatch.setattr(module.random, "uniform", lambda a, b: (a + b) / 2.0)
+    serve_delay = getattr(plugin, "_SiQiRestaurantV3__serve_delay")
+
+    diff = serve_delay({"cook_time": 9}) - serve_delay({"cook_time": 4})
+    assert abs(diff - 5.0) < 0.01
 
 
 def test_serve_pacing_called_per_serve(monkeypatch):
