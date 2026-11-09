@@ -381,8 +381,20 @@ def build_plugin(module):
     return plugin
 
 
+def _patch_sleep(monkeypatch, module):
+    """把 ``asyncio.sleep`` 换成只记录参数、立即返回的协程，避免测试真实等待。"""
+    sleeps: list = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
+    return sleeps
+
+
 def _stub_runtime(monkeypatch, module, *, fetch_payload=None, responses=None):
     """替换网络、站点与调度器，并装入 fetch 状态与 action 响应。"""
+    _patch_sleep(monkeypatch, module)
     scheduler = StubScheduler()
     monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
     monkeypatch.setattr(module, "SiteOper", StubSiteOper)
@@ -416,7 +428,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqirestaurantv3"
-    assert cls.plugin_version == "1.0.0"
+    assert cls.plugin_version == "1.0.1"
     assert cls.plugin_config_prefix == "siqirestaurantv3_"
     assert cls.plugin_order == 32
     assert cls.plugin_author == "tycgd"
@@ -439,7 +451,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.0.0"
+    assert cls.plugin_version == "1.0.1"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -469,7 +481,7 @@ def test_init_defaults(monkeypatch):
     assert plugin._buy_budget_per_day == 5000
     assert plugin._keep_ingredient_stock == 3
     assert plugin._serve_strategy == "match"
-    assert plugin._min_serve_delay_seconds == 0
+    assert plugin._min_serve_delay_seconds == 2
     assert plugin._max_customers_per_run == 0
     assert plugin._max_iterations == 60
     assert plugin._auto_hire_staff is True
@@ -865,6 +877,7 @@ def test_serve_loop_purchase_then_serve(monkeypatch):
             session_status="open", customers_remaining=0, queued_customers=0
         )
     )
+    _patch_sleep(monkeypatch, module)
     plugin = build_plugin(module)
     plugin._auto_purchase = True
     plugin._keep_ingredient_stock = 0
@@ -901,6 +914,7 @@ def test_serve_loop_respects_max_customers_per_run(monkeypatch):
             session_status="open", customers_remaining=0, queued_customers=0
         )
     )
+    _patch_sleep(monkeypatch, module)
     plugin = build_plugin(module)
     plugin._auto_purchase = False
     plugin._max_customers_per_run = 3
@@ -927,6 +941,7 @@ def test_serve_loop_handles_expired_customer_once(monkeypatch):
             session_status="open", customers_remaining=0, queued_customers=0
         )
     )
+    _patch_sleep(monkeypatch, module)
     plugin = build_plugin(module)
     plugin._auto_purchase = False
     plugin._state["dishes"] = _demand_dishes()
@@ -993,6 +1008,7 @@ def test_serve_loop_continues_after_single_failure_spec(monkeypatch):
             ]
         },
     )
+    _patch_sleep(monkeypatch, module)
     plugin = build_plugin(module)
     plugin._auto_purchase = False
     plugin._state["dishes"] = {
@@ -1043,14 +1059,9 @@ def test_serve_loop_polls_when_only_queued(monkeypatch):
 
 
 def test_min_serve_delay_sleep(monkeypatch):
-    """min_serve_delay_seconds 生效时按配置秒数 await asyncio.sleep。"""
+    """min_serve_delay_seconds 作为下限：每客 sleep ∈ [max(min, cook/stations), 120]。"""
     module = load_plugin_module()
-    sleeps: list = []
-
-    async def fake_sleep(delay):
-        sleeps.append(delay)
-
-    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
+    sleeps = _patch_sleep(monkeypatch, module)
     ActionRequestUtils.reset(
         fetch_payload=make_fetch_payload(
             session_status="open", customers_remaining=0, queued_customers=0
@@ -1059,6 +1070,7 @@ def test_min_serve_delay_sleep(monkeypatch):
     plugin = build_plugin(module)
     plugin._auto_purchase = False
     plugin._min_serve_delay_seconds = 7
+    plugin._state["unlocked"] = {"stations": 1}
     plugin._state["dishes"] = _demand_dishes()
     plugin._state["ingredients"] = {"tomato": 5, "egg": 5}
     plugin._state["customer_plan"] = [_waiting(31)]
@@ -1066,7 +1078,98 @@ def test_min_serve_delay_sleep(monkeypatch):
     served = asyncio.run(_serve_loop_of(plugin)(ActionRequestUtils()))
 
     assert served == 1
-    assert 7 in sleeps
+    assert len(sleeps) == 1
+    dish = plugin._state["dishes"]["tomato_egg"]
+    stations = max(1, plugin._state["unlocked"]["stations"])
+    floor = max(plugin._min_serve_delay_seconds, float(dish.get("cook_time") or 0) / stations)
+    for delay in sleeps:
+        assert delay >= floor
+        assert delay <= 120
+
+
+def test_serve_delay_uses_cook_time_over_stations(monkeypatch):
+    """cook_time=8、灶台=2 → 无抖动时 base == 4（并行烹饪）。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._min_serve_delay_seconds = 0
+    plugin._state["unlocked"] = {"stations": 2}
+    monkeypatch.setattr(module.SiQiRestaurantV3, "SERVE_JITTER_MAX", 0)
+    serve_delay = getattr(plugin, "_SiQiRestaurantV3__serve_delay")
+
+    assert serve_delay({"cook_time": 8}) == 4.0
+
+
+def test_serve_delay_floor_min(monkeypatch):
+    """min=5、cook=4、灶台=1 → 结果不小于 min（下限生效）。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._min_serve_delay_seconds = 5
+    plugin._state["unlocked"] = {"stations": 1}
+    monkeypatch.setattr(module.SiQiRestaurantV3, "SERVE_JITTER_MAX", 0)
+    serve_delay = getattr(plugin, "_SiQiRestaurantV3__serve_delay")
+
+    assert serve_delay({"cook_time": 4}) >= 5
+
+
+def test_serve_pacing_called_per_serve(monkeypatch):
+    """成功上菜 N 次 → sleep 恰好 N 次且参数均 >0。"""
+    module = load_plugin_module()
+    sleeps = _patch_sleep(monkeypatch, module)
+    ActionRequestUtils.reset(
+        fetch_payload=make_fetch_payload(
+            session_status="open", customers_remaining=0, queued_customers=0
+        )
+    )
+    plugin = build_plugin(module)
+    plugin._auto_purchase = False
+    plugin._max_customers_per_run = 3
+    plugin._state["unlocked"] = {"stations": 1}
+    plugin._state["dishes"] = {
+        "tomato_egg": {
+            "key": "tomato_egg",
+            "cook_time": 4,
+            "ingredients": [{"key": "tomato", "quantity": 1}],
+        }
+    }
+    plugin._state["ingredients"] = {"tomato": 99}
+    plugin._state["customer_plan"] = [_waiting(i) for i in range(1, 6)]
+
+    served = asyncio.run(_serve_loop_of(plugin)(ActionRequestUtils()))
+
+    assert served == 3
+    assert len(sleeps) == 3
+    assert all(delay > 0 for delay in sleeps)
+
+
+def test_purchase_action_delay(monkeypatch):
+    """每次采购成功后都会 await 一个 ACTION_DELAY 区间内的短间隔。"""
+    module = load_plugin_module()
+    sleeps = _patch_sleep(monkeypatch, module)
+    ActionRequestUtils.reset()
+    plugin = build_plugin(module)
+    plugin._auto_purchase = True
+    plugin._keep_ingredient_stock = 0
+    plugin._buy_budget_per_day = 5000
+    plugin._state["dishes"] = _demand_dishes()
+    plugin._state["ingredients"] = {}
+    plugin._state["ingredient_meta"] = {
+        "tomato": {"price": 10},
+        "egg": {"price": 5},
+    }
+
+    spent = asyncio.run(
+        getattr(plugin, "_SiQiRestaurantV3__purchase_ingredients")(
+            ActionRequestUtils(), [_waiting(7)]
+        )
+    )
+
+    assert ActionRequestUtils.actions.count("purchase_ingredient") == 2
+    assert spent > 0
+    assert len(sleeps) == 2
+    assert all(
+        plugin.ACTION_DELAY_MIN <= delay <= plugin.ACTION_DELAY_MAX
+        for delay in sleeps
+    )
 
 
 def test_serve_success_deducts_local_ingredients(monkeypatch):
@@ -1074,6 +1177,7 @@ def test_serve_success_deducts_local_ingredients(monkeypatch):
     module = load_plugin_module()
     # fetch 返回 None：避免轮末 refetch 把库存覆盖为空
     ActionRequestUtils.reset(fetch_payload=None)
+    _patch_sleep(monkeypatch, module)
     plugin = build_plugin(module)
     plugin._auto_purchase = False
     plugin._state["dishes"] = _demand_dishes()
@@ -1433,6 +1537,7 @@ def test_sync_daily_date_aligns():
 def test_api_endpoints_all_envelopes(monkeypatch):
     """7 个 API 端点全部返回恰好 {success,message,data} 三键。"""
     module = load_plugin_module()
+    _patch_sleep(monkeypatch, module)
     scheduler = StubScheduler()
     monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
     monkeypatch.setattr(module, "SiteOper", StubSiteOper)

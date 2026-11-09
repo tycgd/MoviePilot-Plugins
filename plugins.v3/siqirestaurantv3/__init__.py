@@ -1,6 +1,7 @@
 """思齐开餐馆 V3 插件：自动开店、按顾客需求采购食材与上菜、员工雇佣、每日下馆子。"""
 
 import asyncio
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,7 +25,7 @@ class SiQiRestaurantV3(_PluginBase):
     plugin_name = "思齐开餐馆"
     plugin_desc = "思齐站点开餐馆小游戏自动化：自动开店、按顾客需求采购食材与上菜、员工雇佣、每日下馆子，策略全部可配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqirestaurantv3_"
@@ -45,6 +46,12 @@ class SiQiRestaurantV3(_PluginBase):
     MAX_INTERVAL_MINUTES = 1440
     POLL_SECONDS = 3
     MAX_QUICK_SERVES = 3
+
+    # 上菜节奏拟真化：在按烹饪时间/灶台数计算的基准上叠加随机抖动，
+    # 并为采购、下馆子、雇佣等操作加入短间隔，避免瞬间完成全部顾客。
+    SERVE_JITTER_MAX = 1.2
+    ACTION_DELAY_MIN = 0.25
+    ACTION_DELAY_MAX = 0.6
 
     # 详情页允许直接修改的选项；其余配置只能在配置页调整
     OPTION_WHITELIST: Dict[str, Dict[str, Any]] = {
@@ -100,7 +107,7 @@ class SiQiRestaurantV3(_PluginBase):
     _buy_budget_per_day = 5000
     _keep_ingredient_stock = 3
     _serve_strategy = "match"
-    _min_serve_delay_seconds = 0
+    _min_serve_delay_seconds = 2
     _max_customers_per_run = 0
     _max_iterations = 60
     _auto_hire_staff = True
@@ -179,7 +186,7 @@ class SiQiRestaurantV3(_PluginBase):
             strategy = "match"
         self._serve_strategy = strategy
         self._min_serve_delay_seconds = min(
-            600, self.__safe_int(config.get("min_serve_delay_seconds"), 0, min_value=0)
+            600, self.__safe_int(config.get("min_serve_delay_seconds"), 2, min_value=0)
         )
         self._max_customers_per_run = max(
             0, self.__safe_int(config.get("max_customers_per_run"), 0)
@@ -551,7 +558,7 @@ class SiQiRestaurantV3(_PluginBase):
                                         "type": "number",
                                         "min": 0,
                                         "max": 600,
-                                        "hint": "两次上菜之间的等待",
+                                        "hint": "下限，实际按菜品烹饪时间与灶台数计算",
                                     },
                                 },
                             ),
@@ -1861,6 +1868,16 @@ class SiQiRestaurantV3(_PluginBase):
         self.__record("warn", f"{message}")
         logger.warning(f"思齐开餐馆：开店未成功：{message}")
 
+    def __serve_delay(self, dish: Dict[str, Any]) -> float:
+        """按菜品烹饪时间与已解锁灶台数模拟并行烹饪，并加随机抖动。"""
+        cook = float(dish.get("cook_time") or 0)
+        stations = max(
+            1,
+            self.__safe_int((self._state.get("unlocked") or {}).get("stations"), 1),
+        )
+        base = max(float(self._min_serve_delay_seconds), cook / stations)
+        return min(120.0, max(0.0, base + random.uniform(0, self.SERVE_JITTER_MAX)))
+
     async def __serve_loop(
         self,
         client: AsyncRequestUtils,
@@ -1877,11 +1894,6 @@ class SiQiRestaurantV3(_PluginBase):
             run_cap = self._max_customers_per_run
         else:
             run_cap = None
-        delay = (
-            self._min_serve_delay_seconds
-            if delay_override is None
-            else self.__safe_int(delay_override, 0)
-        )
         max_iterations = max(1, self._max_iterations)
 
         for _ in range(max_iterations):
@@ -1979,8 +1991,13 @@ class SiQiRestaurantV3(_PluginBase):
                     # P1-2：成功上菜后本地扣减食材，避免同轮同一食材被重复使用
                     self.__deduct_ingredients(dish)
                     self.__apply_state(payload)
-                    if delay > 0:
-                        await asyncio.sleep(delay)
+                    if delay_override is None:
+                        await asyncio.sleep(self.__serve_delay(dish))
+                    else:
+                        override = float(self.__safe_int(delay_override, 0))
+                        await asyncio.sleep(
+                            max(self.__serve_delay(dish), override)
+                        )
                 else:
                     message = payload.get("message") or "上菜失败"
                     self.__record("fail", f"顾客 {customer_id} 上菜失败：{message}")
@@ -2091,6 +2108,9 @@ class SiQiRestaurantV3(_PluginBase):
                     self._state["ingredients"] = current
                 current[key] = self.__safe_int(current.get(key), 0) + quantity
                 self.__apply_state(payload)
+                await asyncio.sleep(
+                    random.uniform(self.ACTION_DELAY_MIN, self.ACTION_DELAY_MAX)
+                )
         return spent_now
 
     async def __do_visits(self, client: AsyncRequestUtils) -> int:
@@ -2129,6 +2149,9 @@ class SiQiRestaurantV3(_PluginBase):
                 self._daily["visits"] = self.__safe_int(self._daily.get("visits"), 0) + 1
                 self.__record("visit", f"下馆子：{name}")
                 self.__apply_state(payload)
+                await asyncio.sleep(
+                    random.uniform(self.ACTION_DELAY_MIN, self.ACTION_DELAY_MAX)
+                )
             else:
                 # P2-11：单个目标失败不放弃其余目标
                 message = payload.get("message") or "下馆子失败"
@@ -2156,6 +2179,9 @@ class SiQiRestaurantV3(_PluginBase):
                 label = "厨师" if role == "chef" else "服务员"
                 self.__record("hire", f"雇佣{label} × {quantity}")
                 self.__apply_state(payload)
+                await asyncio.sleep(
+                    random.uniform(self.ACTION_DELAY_MIN, self.ACTION_DELAY_MAX)
+                )
         return hired
 
     def __build_summary(self, served: int) -> str:
