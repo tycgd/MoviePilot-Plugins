@@ -431,7 +431,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqirestaurantv3"
-    assert cls.plugin_version == "1.0.4"
+    assert cls.plugin_version == "1.0.5"
     assert cls.plugin_config_prefix == "siqirestaurantv3_"
     assert cls.plugin_order == 32
     assert cls.plugin_author == "tycgd"
@@ -454,7 +454,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.0.4"
+    assert cls.plugin_version == "1.0.5"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1318,9 +1318,9 @@ def test_action_order_serve_before_hire(monkeypatch):
 
 
 def test_api_serve_now_ready_does_not_start_session(monkeypatch):
-    """N3：session 为 ready 且当日有顾客时，快捷上菜不应触发 start_session。"""
+    """N3：api_serve_now 只提交后台一次性任务，不同步执行、不触发 start_session。"""
     module = load_plugin_module()
-    _stub_runtime(
+    scheduler = _stub_runtime(
         monkeypatch,
         module,
         fetch_payload=make_fetch_payload(
@@ -1334,8 +1334,38 @@ def test_api_serve_now_ready_does_not_start_session(monkeypatch):
 
     result = asyncio.run(plugin.api_serve_now({"count": 3}))
 
-    assert "start_session" not in ActionRequestUtils.actions
+    assert ActionRequestUtils.calls == []
+    assert scheduler.added
+    assert "api_serve_now" in scheduler.added[0][0]
     assert set(result) == {"success", "message", "data"}
+    assert result["success"] is True
+
+
+def test_run_quick_serve_task_limited_and_no_start(monkeypatch):
+    """run_quick_serve_task：最多上 MAX_QUICK_SERVES 位、不开店、silent=True。"""
+    module = load_plugin_module()
+    _stub_runtime(
+        monkeypatch,
+        module,
+        fetch_payload=make_fetch_payload(
+            session_status="open",
+            customers_total=5,
+            customers_remaining=0,
+            queued_customers=0,
+            customer_plan=[_waiting(i) for i in range(1, 6)],
+            inventory_ingredients={"tomato": 99, "egg": 99},
+        ),
+    )
+    plugin = build_plugin(module)
+    plugin._auto_purchase = False
+    plugin._auto_start_session = False
+
+    result = asyncio.run(plugin.run_quick_serve_task())
+
+    served_calls = ActionRequestUtils.actions.count("serve_customer")
+    assert 1 <= served_calls <= plugin.MAX_QUICK_SERVES, served_calls
+    assert "start_session" not in ActionRequestUtils.actions
+    assert result["silent"] is True
 
 
 def test_expired_customer_ids_only_waiting():
@@ -1997,6 +2027,106 @@ def test_page_button_api_prefix():
     for api in apis:
         assert api.startswith("plugin/SiQiRestaurantV3/"), api
         assert "apikey=" not in api, api
+
+
+def _log_table_of(plugin):
+    """取插件内部经营记录表构造函数。"""
+    return getattr(plugin, "_SiQiRestaurantV3__log_table")
+
+
+def _log_header_texts(table):
+    """从 VTable 的 thead 提取表头文字。"""
+    for node in _iter_nodes(table):
+        if node.get("component") == "thead":
+            return [th.get("text") for th in node["content"][0]["content"]]
+    return []
+
+
+def _log_body_rows(table):
+    """从 VTable 的 tbody 提取数据行。"""
+    for node in _iter_nodes(table):
+        if node.get("component") == "tbody":
+            return list(node.get("content") or [])
+    return []
+
+
+def test_log_table_plugin_history_headers():
+    """daily.history（time/action/detail）按 3 列渲染，不再错位为 4 列。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    history = [
+        {"time": "10:00:01", "action": "open", "detail": "已开启今日营业"},
+        {"time": "10:05:02", "action": "serve", "detail": "上菜 tomato_egg 给顾客 1"},
+        {"time": "10:06:03", "action": "run", "detail": "本轮完成"},
+    ]
+
+    table = _log_table_of(plugin)(history)
+
+    assert _log_header_texts(table) == ["时间", "动作", "详情"]
+    rows = _log_body_rows(table)
+    assert len(rows) == 3
+    # 逆序展示：最新一条在最前
+    assert [cell["text"] for cell in rows[0]["content"]] == [
+        "10:06:03",
+        "run",
+        "本轮完成",
+    ]
+    chip_texts = [
+        node.get("text")
+        for node in _iter_nodes(table)
+        if node.get("component") == "VChip"
+    ]
+    assert any("3 条" in str(text) for text in chip_texts)
+    assert not any("1 条" in str(text) for text in chip_texts)
+
+
+def test_log_table_site_logs_headers():
+    """site logs（log_date/customers_served）保持 4 列渲染。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    history = [
+        {
+            "log_date": "2026-11-09",
+            "customers_served": 3,
+            "customers_total": 14,
+            "popularity_change": 5,
+            "net_earnings": 200,
+        }
+    ]
+
+    table = _log_table_of(plugin)(history)
+
+    assert _log_header_texts(table) == ["日期", "顾客(服务/总)", "受欢迎变化", "净收益"]
+    rows = _log_body_rows(table)
+    assert len(rows) == 1
+    assert [cell["text"] for cell in rows[0]["content"]] == [
+        "2026-11-09",
+        "3/14",
+        "5",
+        "200",
+    ]
+
+
+def test_form_cookie_is_password(monkeypatch):
+    """配置页 Cookie 字段使用密码框显示，且回填原值以便保存不清空。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    plugin = build_plugin(module)
+
+    form, model = plugin.get_form()
+
+    assert isinstance(form, list)
+    assert isinstance(model, dict)
+    cookie_field = None
+    for node in _iter_nodes(form):
+        props = node.get("props") or {}
+        if node.get("component") == "VTextField" and props.get("model") == "cookie":
+            cookie_field = node
+            break
+
+    assert cookie_field is not None, "配置页应包含 Cookie 字段"
+    assert cookie_field["props"].get("type") == "password"
+    assert cookie_field["props"].get("value") == model["cookie"]
 
 
 # ---------------------------------------------------------------------------

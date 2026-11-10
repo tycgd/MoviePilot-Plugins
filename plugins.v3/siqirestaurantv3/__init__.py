@@ -25,7 +25,7 @@ class SiQiRestaurantV3(_PluginBase):
     plugin_name = "思齐开餐馆"
     plugin_desc = "思齐站点开餐馆小游戏自动化：自动开店、按顾客需求采购食材与上菜、员工雇佣、每日下馆子，策略全部可配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqirestaurantv3_"
@@ -122,7 +122,7 @@ class SiQiRestaurantV3(_PluginBase):
     _visit_targets = ""
     _visit_count_limit = 3
 
-    ONCE_JOB_IDS = ("run_once", "api_run_once", "command_run_once")
+    ONCE_JOB_IDS = ("run_once", "api_run_once", "command_run_once", "api_serve_now")
 
     _lock: Optional[asyncio.Lock] = None
     _daily: Dict[str, Any] = {
@@ -323,7 +323,7 @@ class SiQiRestaurantV3(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "页面快捷上菜",
-                "description": "同步执行少量上菜；演练模式下仅同步状态",
+                "description": "提交后台快捷上菜任务，立即返回",
             },
             {
                 "path": "/sync",
@@ -468,6 +468,8 @@ class SiQiRestaurantV3(_PluginBase):
                                         "label": "站点 Cookie",
                                         "placeholder": "留空则自动读取站点管理中 si-qi.xyz 的 Cookie",
                                         "value": cookie_value,
+                                        "type": "password",
+                                        "hint": "Cookie 会以密码形式显示；留空则沿用站点管理中的 si-qi.xyz Cookie",
                                     },
                                 },
                             ),
@@ -1497,41 +1499,45 @@ class SiQiRestaurantV3(_PluginBase):
 
     def __log_table(self, history: List[Any]) -> Dict[str, Any]:
         """经营记录表：优先展示站点 logs，兼容每日 history。"""
+        site_mode = any(
+            isinstance(x, dict) and ("log_date" in x or "customers_served" in x)
+            for x in (history or [])
+        )
+        headers = (
+            ["日期", "顾客(服务/总)", "受欢迎变化", "净收益"]
+            if site_mode
+            else ["时间", "动作", "详情"]
+        )
         rows = []
         for item in list(history or [])[-8:][::-1]:
             if not isinstance(item, dict):
                 continue
-            if "log_date" in item or "customers_served" in item:
-                rows.append(
-                    {
-                        "component": "tr",
-                        "content": [
-                            {"component": "td", "text": str(item.get("log_date", ""))},
-                            {
-                                "component": "td",
-                                "text": f"{self.__safe_int(item.get('customers_served'), 0)}"
-                                f"/{self.__safe_int(item.get('customers_total'), 0)}",
-                            },
-                            {
-                                "component": "td",
-                                "text": str(item.get("popularity_change", "")),
-                            },
-                            {"component": "td", "text": str(item.get("net_earnings", ""))},
-                        ],
-                    }
-                )
+            is_site = "log_date" in item or "customers_served" in item
+            if site_mode and not is_site:
+                continue
+            if not site_mode and is_site:
+                continue
+            if is_site:
+                cells = [
+                    str(item.get("log_date", "")),
+                    f"{self.__safe_int(item.get('customers_served'), 0)}"
+                    f"/{self.__safe_int(item.get('customers_total'), 0)}",
+                    str(item.get("popularity_change", "")),
+                    str(item.get("net_earnings", "")),
+                ]
             else:
-                rows.append(
-                    {
-                        "component": "tr",
-                        "content": [
-                            {"component": "td", "text": str(item.get("time", ""))},
-                            {"component": "td", "text": str(item.get("action", ""))},
-                            {"component": "td", "text": str(item.get("detail", ""))},
-                            {"component": "td", "text": ""},
-                        ],
-                    }
-                )
+                cells = [
+                    str(item.get("time", "")),
+                    str(item.get("action", "")),
+                    str(item.get("detail", "")),
+                ]
+            rows.append(
+                {
+                    "component": "tr",
+                    "content": [{"component": "td", "text": text} for text in cells],
+                }
+            )
+        data_count = len(rows)
         if not rows:
             rows.append(
                 {
@@ -1539,12 +1545,13 @@ class SiQiRestaurantV3(_PluginBase):
                     "content": [
                         {
                             "component": "td",
-                            "props": {"colspan": 4},
+                            "props": {"colspan": len(headers)},
                             "text": "暂无执行记录",
                         }
                     ],
                 }
             )
+        chip_text = f"最近 {data_count} 条" if data_count else "暂无记录"
         return {
             "component": "VCard",
             "props": {"variant": "outlined", "class": "mb-4"},
@@ -1558,7 +1565,7 @@ class SiQiRestaurantV3(_PluginBase):
                         {
                             "component": "VChip",
                             "props": {"size": "small", "variant": "tonal"},
-                            "text": f"最近 {len(rows)} 条",
+                            "text": chip_text,
                         },
                     ],
                 },
@@ -1575,10 +1582,8 @@ class SiQiRestaurantV3(_PluginBase):
                                         {
                                             "component": "tr",
                                             "content": [
-                                                {"component": "th", "text": "日期"},
-                                                {"component": "th", "text": "顾客(服务/总)"},
-                                                {"component": "th", "text": "受欢迎变化"},
-                                                {"component": "th", "text": "净收益"},
+                                                {"component": "th", "text": head}
+                                                for head in headers
                                             ],
                                         }
                                     ],
@@ -1693,50 +1698,27 @@ class SiQiRestaurantV3(_PluginBase):
     async def api_serve_now(
         self, payload: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """API：页面快捷上菜；同步执行，响应为三键外壳。"""
+        """API：提交后台快捷上菜任务，立即返回。"""
         payload = payload if isinstance(payload, dict) else {}
         count = min(
             self.MAX_QUICK_SERVES,
-            max(1, self.__safe_int(payload.get("count"), 3, min_value=1)),
+            max(1, self.__safe_int(payload.get("count"), self.MAX_QUICK_SERVES)),
         )
-        lock = self.__get_lock()
-        if lock.locked():
+        if self.__get_lock().locked():
             logger.warning("思齐开餐馆：快捷上菜被跳过，已有任务执行中")
             return self.__api_response(
-                False, "已有开餐馆任务正在执行，请稍后再试", {"status": "running"}
+                False, "已有开餐馆任务正在执行", {"status": "running"}
             )
-
-        async with lock:
-            result = self.__new_result()
-            try:
-                await self.__execute(
-                    result,
-                    serves_limit=count,
-                    allow_visit=False,
-                    allow_hire=False,
-                    allow_start=False,
-                )
-            except httpx2.TimeoutException:
-                result["status"] = "error"
-                result["message"] = "请求超时"
-                logger.error("思齐开餐馆：快捷上菜请求超时")
-            except httpx2.RequestError as e:
-                result["status"] = "error"
-                result["message"] = f"请求异常：{e}"
-                logger.error(f"思齐开餐馆：快捷上菜请求异常：{e}")
-            except Exception as e:
-                result["status"] = "error"
-                result["message"] = f"执行异常：{e}"
-                logger.error(f"思齐开餐馆：快捷上菜执行异常：{e}")
-
-            self.__finish_task(result)
-
-        status = str(result.get("status") or "")
-        data = result.get("data")
-        data = dict(data) if isinstance(data, dict) else {}
-        data["status"] = status
-        data["timestamp"] = result.get("timestamp")
-        return self.__api_response(status == "completed", result.get("message"), data)
+        scheduler_sdk.add_plugin_once_job(
+            self.__class__.__name__,
+            "api_serve_now",
+            self.run_quick_serve_task,
+            "思齐开餐馆快捷上菜",
+            delay_seconds=1,
+        )
+        return self.__api_response(
+            True, f"已提交快捷上菜（最多 {count} 位），稍后完成"
+        )
 
     async def api_sync(self) -> Dict[str, Any]:
         """API：只同步站点状态，绝不调用任何写操作。"""
@@ -1910,6 +1892,38 @@ class SiQiRestaurantV3(_PluginBase):
                 result["message"] = f"执行异常：{e}"
                 logger.error(f"思齐开餐馆：执行异常：{e}")
 
+            self.__finish_task(result)
+            return result
+
+    async def run_quick_serve_task(self) -> Dict[str, Any]:
+        """执行一次后台快捷上菜：加锁少量上菜、不额外通知。"""
+        lock = self.__get_lock()
+        if lock.locked():
+            return self.__new_result("running", "已有开餐馆任务正在执行")
+        async with lock:
+            result = self.__new_result()
+            try:
+                await self.__execute(
+                    result,
+                    serves_limit=self.MAX_QUICK_SERVES,
+                    allow_visit=False,
+                    allow_hire=False,
+                    allow_start=False,
+                )
+            except httpx2.TimeoutException:
+                result["status"] = "error"
+                result["message"] = "请求超时"
+                logger.error("思齐开餐馆：快捷上菜请求超时")
+            except httpx2.RequestError as e:
+                result["status"] = "error"
+                result["message"] = f"请求异常：{e}"
+                logger.error(f"思齐开餐馆：快捷上菜请求异常：{e}")
+            except Exception as e:
+                result["status"] = "error"
+                result["message"] = f"执行异常：{e}"
+                logger.error(f"思齐开餐馆：快捷上菜执行异常：{e}")
+
+            result["silent"] = True
             self.__finish_task(result)
             return result
 
