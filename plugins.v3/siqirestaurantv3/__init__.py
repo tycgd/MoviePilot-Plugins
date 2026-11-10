@@ -25,7 +25,7 @@ class SiQiRestaurantV3(_PluginBase):
     plugin_name = "思齐开餐馆"
     plugin_desc = "思齐站点开餐馆小游戏自动化：自动开店、按顾客需求采购食材与上菜、员工雇佣、每日下馆子，策略全部可配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqirestaurantv3_"
@@ -95,14 +95,18 @@ class SiQiRestaurantV3(_PluginBase):
         "max_iterations",
         "max_customers_per_run",
         "keep_ingredient_stock",
+        "retry_enabled",
+        "retry_cron",
     )
 
     _enabled = False
     _notify = True
     _cookie = ""
-    _schedule_mode = "interval"
-    _cron = "7 */2 * * *"
+    _schedule_mode = "cron"
+    _cron = "12 10 * * *"
     _interval_minutes = 30
+    _retry_enabled = True
+    _retry_cron = "12 15 * * *"
 
     _dry_run = False
     _auto_start_session = True
@@ -124,6 +128,7 @@ class SiQiRestaurantV3(_PluginBase):
     _daily: Dict[str, Any] = {
         "date": "",
         "sessions": 0,
+        "completed": False,
         "customers_served": 0,
         "customers_left": 0,
         "magic_spent": 0,
@@ -168,8 +173,10 @@ class SiQiRestaurantV3(_PluginBase):
         self._enabled = bool(config.get("enabled", False))
         self._notify = bool(config.get("notify", True))
         self._cookie = (config.get("cookie") or site_cookie or "").strip()
-        self._schedule_mode = config.get("schedule_mode", "interval")
-        self._cron = (config.get("cron") or "7 */2 * * *").strip()
+        self._schedule_mode = config.get("schedule_mode", "cron")
+        self._cron = (config.get("cron") or "12 10 * * *").strip()
+        self._retry_enabled = bool(config.get("retry_enabled", True))
+        self._retry_cron = (config.get("retry_cron") or "12 15 * * *").strip()
         self._interval_minutes = min(
             self.MAX_INTERVAL_MINUTES,
             self.__safe_int(config.get("interval_minutes"), 30, min_value=1),
@@ -208,6 +215,7 @@ class SiQiRestaurantV3(_PluginBase):
         self._daily = {
             "date": saved_daily.get("date") or "",
             "sessions": self.__safe_int(saved_daily.get("sessions"), 0),
+            "completed": bool(saved_daily.get("completed", False)),
             "customers_served": self.__safe_int(
                 saved_daily.get("customers_served"), 0
             ),
@@ -349,7 +357,7 @@ class SiQiRestaurantV3(_PluginBase):
                 logger.warning(f"思齐开餐馆：Cron 配置无效：{e}")
                 return []
 
-        return [
+        services = [
             {
                 "id": self.__class__.__name__,
                 "name": self.plugin_name,
@@ -358,6 +366,24 @@ class SiQiRestaurantV3(_PluginBase):
                 "kwargs": {},
             }
         ]
+
+        if self._schedule_mode == "cron" and self._retry_enabled and self._retry_cron:
+            try:
+                retry_trigger = CronTrigger.from_crontab(self._retry_cron)
+                logger.info(f"思齐开餐馆：使用补查 Cron 触发器 {self._retry_cron}")
+                services.append(
+                    {
+                        "id": f"{self.__class__.__name__}_retry",
+                        "name": f"{self.plugin_name}补查",
+                        "trigger": retry_trigger,
+                        "func": self.run_restaurant_task,
+                        "kwargs": {},
+                    }
+                )
+            except ValueError as e:
+                logger.warning(f"思齐开餐馆：补查 Cron 配置无效：{e}")
+
+        return services
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """构造配置页表单与默认值模型。"""
@@ -475,6 +501,36 @@ class SiQiRestaurantV3(_PluginBase):
                                         "min": 1,
                                         "max": 1440,
                                         "hint": "间隔模式下生效",
+                                    },
+                                },
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__form_col(
+                                12,
+                                6,
+                                {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "retry_enabled",
+                                        "label": "启用补查（cron 模式）",
+                                        "hint": "主任务后补查一次，仅 cron 模式生效",
+                                    },
+                                },
+                            ),
+                            self.__form_col(
+                                12,
+                                6,
+                                {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "retry_cron",
+                                        "label": "补查 Cron",
+                                        "placeholder": "12 15 * * *",
+                                        "hint": "默认 12 15 * * *（每天 15:12），仅 cron 模式生效",
                                     },
                                 },
                             ),
@@ -679,6 +735,8 @@ class SiQiRestaurantV3(_PluginBase):
             "schedule_mode": self._schedule_mode,
             "cron": self._cron,
             "interval_minutes": self._interval_minutes,
+            "retry_enabled": self._retry_enabled,
+            "retry_cron": self._retry_cron,
             "dry_run": self._dry_run,
             "auto_start_session": self._auto_start_session,
             "auto_purchase": self._auto_purchase,
@@ -712,7 +770,9 @@ class SiQiRestaurantV3(_PluginBase):
         if self._schedule_mode == "interval":
             schedule_info = f"每 {self._interval_minutes} 分钟"
         else:
-            schedule_info = f"Cron: {self._cron}"
+            schedule_info = f"Cron {self._cron}"
+            if self._retry_enabled:
+                schedule_info += f"；补查 {self._retry_cron}"
 
         served_today = max(0, self.__safe_int(state.get("customers_served"), 0))
         total_today = max(0, self.__safe_int(state.get("customers_total"), 0))
@@ -1758,6 +1818,18 @@ class SiQiRestaurantV3(_PluginBase):
             logger.error("思齐开餐馆：Cookie 缺失或格式不正确")
             return
 
+        today_cn = datetime.now(self.TZ_CN).strftime("%Y-%m-%d")
+        if (
+            str(self._state.get("cur_date") or "") == today_cn
+            and self._state.get("session_status") == "closed"
+            and str(self._daily.get("date") or "") == today_cn
+            and self.__safe_int(self._daily.get("sessions"), 0) >= 1
+        ):
+            result["status"] = "completed"
+            result["silent"] = True
+            result["message"] = "今日已营业完成，跳过本次触发"
+            return
+
         self._daily = self.__roll_daily(
             self._daily, datetime.now(self.TZ_CN).strftime("%Y-%m-%d")
         )
@@ -1778,6 +1850,17 @@ class SiQiRestaurantV3(_PluginBase):
 
         self.__apply_state(data)
         self.__sync_daily_date(self._state.get("cur_date"))
+
+        if (
+            self._state.get("session_status") == "closed"
+            and self.__safe_int(self._daily.get("sessions"), 0) >= 1
+            and str(self._daily.get("date")) == str(self._state.get("cur_date"))
+        ):
+            result["status"] = "completed"
+            result["silent"] = True
+            result["message"] = "今日已营业完成，跳过本次触发"
+            return
+
         result["data"] = self.__result_snapshot()
 
         if self._dry_run:
@@ -1823,6 +1906,7 @@ class SiQiRestaurantV3(_PluginBase):
         summary = self.__build_summary(served)
         # P1-3：收尾状态分级：remaining<=0 → completed；served>0 → partial；否则 failed
         remaining = self.__safe_int(self._state.get("customers_remaining"), 0)
+        self._daily["completed"] = remaining <= 0
         if remaining <= 0:
             status = "completed"
         elif served > 0:
@@ -1854,6 +1938,12 @@ class SiQiRestaurantV3(_PluginBase):
         status = self._state.get("session_status")
         total = self.__safe_int(self._state.get("customers_total"), 0)
         if status != "ready" or total <= 0:
+            return
+        if (
+            self.__safe_int(self._daily.get("sessions"), 0) >= 1
+            and str(self._daily.get("date")) == str(self._state.get("cur_date"))
+        ):
+            self.__record("skip", "今日已开过店，跳过重复开店")
             return
         payload = await self.__post_action(client, "start_session")
         if self.__game_ok(payload):
@@ -2609,6 +2699,7 @@ class SiQiRestaurantV3(_PluginBase):
         return {
             "date": today,
             "sessions": 0,
+            "completed": False,
             "customers_served": 0,
             "customers_left": 0,
             "magic_spent": 0,
@@ -2973,7 +3064,7 @@ class SiQiRestaurantV3(_PluginBase):
 
     def __finish_task(self, result: Dict[str, Any]) -> None:
         """任务收尾：按需通知并保存状态。"""
-        if self._notify:
+        if self._notify and not result.get("silent"):
             self.__send_notification(result)
         self._state["last_message"] = result.get("message", "")
         self.__save_state()

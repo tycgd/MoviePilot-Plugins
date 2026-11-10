@@ -308,9 +308,11 @@ def build_plugin(module):
     plugin._enabled = True
     plugin._notify = False
     plugin._cookie = "c_secure_pass=token"
-    plugin._schedule_mode = "interval"
-    plugin._cron = "7 */2 * * *"
+    plugin._schedule_mode = "cron"
+    plugin._cron = "12 10 * * *"
     plugin._interval_minutes = 30
+    plugin._retry_enabled = True
+    plugin._retry_cron = "12 15 * * *"
 
     plugin._dry_run = False
     plugin._auto_start_session = True
@@ -330,6 +332,7 @@ def build_plugin(module):
     plugin._daily = {
         "date": _today(module),
         "sessions": 0,
+        "completed": False,
         "customers_served": 0,
         "customers_left": 0,
         "magic_spent": 0,
@@ -428,7 +431,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqirestaurantv3"
-    assert cls.plugin_version == "1.0.2"
+    assert cls.plugin_version == "1.0.3"
     assert cls.plugin_config_prefix == "siqirestaurantv3_"
     assert cls.plugin_order == 32
     assert cls.plugin_author == "tycgd"
@@ -451,7 +454,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.0.2"
+    assert cls.plugin_version == "1.0.3"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -472,9 +475,11 @@ def test_init_defaults(monkeypatch):
     assert plugin._enabled is False
     assert plugin._notify is True
     assert plugin._cookie == ""
-    assert plugin._schedule_mode == "interval"
-    assert plugin._cron == "7 */2 * * *"
+    assert plugin._schedule_mode == "cron"
+    assert plugin._cron == "12 10 * * *"
     assert plugin._interval_minutes == 30
+    assert plugin._retry_enabled is True
+    assert plugin._retry_cron == "12 15 * * *"
     assert plugin._dry_run is False
     assert plugin._auto_start_session is True
     assert plugin._auto_purchase is True
@@ -489,6 +494,7 @@ def test_init_defaults(monkeypatch):
     assert plugin._visit_targets == ""
     assert plugin._visit_count_limit == 3
     assert plugin._daily["date"] == _today(module)
+    assert plugin._daily["completed"] is False
 
 
 def test_init_idempotent(monkeypatch):
@@ -1737,6 +1743,142 @@ def test_command_filters_action(monkeypatch):
 
     asyncio.run(plugin.run_once_command(other))
     assert len(scheduler.added) == 1
+
+
+# ---------------------------------------------------------------------------
+# 每日调度 / 补查 / 当日闸门
+# ---------------------------------------------------------------------------
+
+
+def test_get_service_daily_and_retry(monkeypatch):
+    """cron 模式默认返回主任务 + 补查两个服务，id 与 trigger 均正确。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    plugin = build_plugin(module)
+    plugin._enabled = True
+    plugin._schedule_mode = "cron"
+    plugin._cron = "12 10 * * *"
+    plugin._retry_enabled = True
+    plugin._retry_cron = "12 15 * * *"
+
+    services = plugin.get_service()
+
+    assert len(services) == 2
+    cls_name = module.SiQiRestaurantV3.__name__
+    assert services[0]["id"] == cls_name
+    assert services[1]["id"] == f"{cls_name}_retry"
+    assert services[0]["trigger"] is not None
+    assert services[1]["trigger"] is not None
+
+
+def test_get_service_retry_disabled(monkeypatch):
+    """_retry_enabled=False 时只返回主服务。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    plugin = build_plugin(module)
+    plugin._enabled = True
+    plugin._schedule_mode = "cron"
+    plugin._cron = "12 10 * * *"
+    plugin._retry_enabled = False
+
+    services = plugin.get_service()
+
+    assert len(services) == 1
+
+
+def test_daily_gate_skips_without_network(monkeypatch):
+    """当日已营业完成时，缓存命中直接静默跳过且不发任何请求。"""
+    module = load_plugin_module()
+    _stub_runtime(monkeypatch, module)
+    plugin = build_plugin(module)
+    today = _today(module)
+    plugin._state["cur_date"] = today
+    plugin._state["session_status"] = "closed"
+    plugin._daily["date"] = today
+    plugin._daily["sessions"] = 1
+
+    result = _run_execute(plugin)
+
+    assert result["status"] == "completed"
+    assert result.get("silent") is True
+    assert ActionRequestUtils.calls == []
+
+
+def test_daily_gate_skips_after_fetch(monkeypatch):
+    """缓存状态未同步时，fetch 后发现当日已完成同样静默跳过。"""
+    module = load_plugin_module()
+    today = _today(module)
+    _stub_runtime(
+        monkeypatch,
+        module,
+        fetch_payload=make_fetch_payload(
+            session_status="closed",
+            cur_date=today,
+            customers_total=5,
+            customers_served=5,
+            customers_remaining=0,
+        ),
+    )
+    plugin = build_plugin(module)
+    plugin._state["cur_date"] = ""  # 缓存状态日期非今天，首道闸门不命中
+    plugin._daily["date"] = today
+    plugin._daily["sessions"] = 1
+
+    result = _run_execute(plugin)
+
+    assert result["status"] == "completed"
+    assert result.get("silent") is True
+    actions = ActionRequestUtils.actions
+    assert "start_session" not in actions
+    assert "visit_restaurant" not in actions
+    assert "hire_staff" not in actions
+
+
+def test_ensure_session_not_repeat_same_day(monkeypatch):
+    """当日已开过店（sessions>=1 且同日）时，ready 也不再 POST start_session。"""
+    module = load_plugin_module()
+    today = _today(module)
+    _stub_runtime(
+        monkeypatch,
+        module,
+        fetch_payload=make_fetch_payload(
+            session_status="ready",
+            customers_total=3,
+            customers_remaining=0,
+        ),
+    )
+    plugin = build_plugin(module)
+    plugin._state["cur_date"] = today
+    plugin._state["session_status"] = "ready"
+    plugin._daily["date"] = today
+    plugin._daily["sessions"] = 1
+
+    _run_execute(plugin)
+
+    assert "start_session" not in ActionRequestUtils.actions
+
+
+def test_finish_task_silent_no_notification(monkeypatch):
+    """result["silent"] 为真时不发通知，否则正常通知。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    calls: list = []
+    plugin.post_message = lambda **kwargs: calls.append(kwargs)
+    plugin._notify = True
+    finish = getattr(plugin, "_SiQiRestaurantV3__finish_task")
+
+    finish(
+        {
+            "status": "completed",
+            "message": "今日已营业完成，跳过本次触发",
+            "silent": True,
+            "data": {},
+        }
+    )
+    assert calls == []
+
+    finish({"status": "completed", "message": "正常完成", "data": {}})
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
