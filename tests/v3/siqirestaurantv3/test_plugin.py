@@ -431,7 +431,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqirestaurantv3"
-    assert cls.plugin_version == "1.0.3"
+    assert cls.plugin_version == "1.0.4"
     assert cls.plugin_config_prefix == "siqirestaurantv3_"
     assert cls.plugin_order == 32
     assert cls.plugin_author == "tycgd"
@@ -454,7 +454,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.0.3"
+    assert cls.plugin_version == "1.0.4"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1997,6 +1997,194 @@ def test_page_button_api_prefix():
     for api in apis:
         assert api.startswith("plugin/SiQiRestaurantV3/"), api
         assert "apikey=" not in api, api
+
+
+# ---------------------------------------------------------------------------
+# 数据新鲜度 / 未启用提示 / 旧配置迁移
+# ---------------------------------------------------------------------------
+
+
+def _page_text(node):
+    """把页面节点里所有 ``text`` 字段拼成一段文本，便于断言。"""
+    texts: list = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            if isinstance(value.get("text"), str):
+                texts.append(value["text"])
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(node)
+    return "\n".join(texts)
+
+
+def _find_card(page, marker):
+    """从页面顶层卡片中找到含指定标记的那张。"""
+    for node in page:
+        if isinstance(node, dict) and marker in _page_text(node):
+            return node
+    return {}
+
+
+def _set_stale_state(plugin, module):
+    """把运行态设为「昨日已打烊、今日尚未经营」的旧快照。"""
+    yesterday = (datetime.now(_timezone(module)) - timedelta(days=1)).strftime(
+        "%Y-%m-%d"
+    )
+    plugin._enabled = True
+    plugin._state.update(
+        {
+            "cur_date": yesterday,
+            "session_status": "closed",
+            "customers_served": 14,
+            "customers_total": 14,
+            "customers_remaining": 0,
+        }
+    )
+    plugin._daily["date"] = _today(module)
+    return yesterday
+
+
+def test_page_stale_shows_today_not_operated():
+    """数据日期为昨天时页面提示今日尚未经营，且不再展示今日顾客标签。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    _set_stale_state(plugin, module)
+
+    text = _page_text(plugin.get_page())
+
+    assert "今日尚未经营" in text
+    assert "数据日期" in text
+    assert "今日顾客（已服务/总数）" not in text
+
+
+def test_page_fresh_shows_today_label():
+    """cur_date 为今天时保留今日顾客（已服务/总数）标签。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._state["cur_date"] = _today(module)
+
+    text = _page_text(plugin.get_page())
+
+    assert "今日顾客（已服务/总数）" in text
+
+
+def test_page_disabled_has_warning():
+    """插件未启用时页面顶部出现未启用警示。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._enabled = False
+
+    text = _page_text(plugin.get_page())
+
+    assert "插件未启用" in text
+
+
+def test_page_stale_overview_not_closed_chip():
+    """stale 时今日概览状态徽章为待同步而非昨日已打烊。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    _set_stale_state(plugin, module)
+
+    overview = _find_card(plugin.get_page(), "📊 今日概览")
+    text = _page_text(overview)
+
+    assert "待同步" in text
+    assert "已打烊" not in text
+
+
+def test_init_migrates_legacy_schedule(monkeypatch):
+    """旧版 interval/30 默认调度在 init 时迁移为每天 10:12 营业 + 15:12 补查。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    plugin = build_plugin(module)
+    calls: list = []
+
+    def recorder(config):
+        calls.append(dict(config))
+        plugin._config_snapshot = dict(config)
+
+    monkeypatch.setattr(plugin, "update_config", recorder)
+
+    legacy = {
+        "enabled": True,
+        "schedule_mode": "interval",
+        "interval_minutes": 30,
+        "cron": "7 */2 * * *",
+    }
+    plugin.init_plugin(legacy)
+
+    assert plugin._schedule_mode == "cron"
+    assert plugin._cron == "12 10 * * *"
+    assert plugin._retry_enabled is True
+    assert plugin._retry_cron == "12 15 * * *"
+    assert len(calls) == 1
+    assert calls[0]["schedule_mode"] == "cron"
+
+    # 再 init 含 retry_enabled 的新配置，不应重复迁移
+    plugin.init_plugin(
+        {
+            "enabled": True,
+            "schedule_mode": "cron",
+            "cron": "12 10 * * *",
+            "retry_enabled": True,
+            "retry_cron": "12 15 * * *",
+        }
+    )
+    assert len(calls) == 1
+
+
+def test_init_does_not_migrate_custom_interval(monkeypatch):
+    """自定义间隔或自定义 cron 不触发旧配置迁移。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+
+    plugin = build_plugin(module)
+    calls: list = []
+    monkeypatch.setattr(plugin, "update_config", lambda cfg: calls.append(dict(cfg)))
+    plugin.init_plugin(
+        {
+            "enabled": True,
+            "schedule_mode": "interval",
+            "interval_minutes": 61,
+            "cron": "7 */2 * * *",
+        }
+    )
+    assert plugin._schedule_mode == "interval"
+    assert plugin._interval_minutes == 61
+    assert calls == []
+
+    plugin2 = build_plugin(module)
+    calls2: list = []
+    monkeypatch.setattr(plugin2, "update_config", lambda cfg: calls2.append(dict(cfg)))
+    plugin2.init_plugin(
+        {
+            "enabled": True,
+            "schedule_mode": "interval",
+            "interval_minutes": 30,
+            "cron": "0 8 * * *",
+        }
+    )
+    assert plugin2._schedule_mode == "interval"
+    assert calls2 == []
+
+
+def test_api_status_has_freshness_fields():
+    """/status 返回数据包含 enabled/today/state_date/is_stale 新鲜度字段。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+
+    response = asyncio.run(plugin.api_status())
+    data = response["data"]
+
+    for key in ("enabled", "today", "state_date", "is_stale"):
+        assert key in data
+    assert data["enabled"] is True
+    assert data["today"] == _today(module)
 
 
 # ---------------------------------------------------------------------------

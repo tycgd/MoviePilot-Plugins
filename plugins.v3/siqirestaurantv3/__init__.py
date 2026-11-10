@@ -25,7 +25,7 @@ class SiQiRestaurantV3(_PluginBase):
     plugin_name = "思齐开餐馆"
     plugin_desc = "思齐站点开餐馆小游戏自动化：自动开店、按顾客需求采购食材与上菜、员工雇佣、每日下馆子，策略全部可配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqirestaurantv3_"
@@ -168,6 +168,30 @@ class SiQiRestaurantV3(_PluginBase):
     def init_plugin(self, config: dict = None):
         """读取配置与持久化状态；允许重复调用，不在此处发起网络请求。"""
         config = config or {}
+        raw = dict(config or {})
+        legacy = (
+            "retry_enabled" not in raw
+            and str(raw.get("schedule_mode") or "") == "interval"
+            and self.__safe_int(raw.get("interval_minutes"), 30) == 30
+            and (raw.get("cron") or "7 */2 * * *") == "7 */2 * * *"
+        )
+        if legacy:
+            raw.update(
+                {
+                    "schedule_mode": "cron",
+                    "cron": "12 10 * * *",
+                    "retry_enabled": True,
+                    "retry_cron": "12 15 * * *",
+                }
+            )
+            config = raw
+            try:
+                self.update_config(raw)
+            except Exception as e:
+                logger.warning(f"思齐开餐馆：迁移旧调度配置失败：{e}")
+            logger.warning(
+                "思齐开餐馆：检测到旧版默认调度(interval/30)，已迁移为每天 10:12 营业 + 15:12 补查"
+            )
         site_cookie = self.__get_site_cookie()
 
         self._enabled = bool(config.get("enabled", False))
@@ -753,17 +777,34 @@ class SiQiRestaurantV3(_PluginBase):
             "run_once": False,
         }
 
+    def __today_cn(self) -> str:
+        """返回东八区今天的日期字符串 YYYY-MM-DD。"""
+        return datetime.now(self.TZ_CN).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def __alert(text: str, color: str = "warning") -> Dict[str, Any]:
+        """构造一条 VAlert 提示条。"""
+        return {
+            "component": "VAlert",
+            "props": {"type": color, "variant": "tonal", "text": text},
+        }
+
     def get_page(self) -> List[dict]:
         """详情页：Hero 概览、今日概览、快捷操作、策略调节、经营记录与策略摘要。"""
         state = self._state or {}
         daily = self._daily or {}
 
+        today = self.__today_cn()
+        state_date = str((self._state or {}).get("cur_date") or "")
+        data_date = state_date or str((self._daily or {}).get("date") or "")
+        is_stale = (not data_date) or (data_date != today)
+
         updated_at = state.get("updated_at") or ""
         if updated_at:
             try:
-                updated_at = datetime.fromtimestamp(float(updated_at)).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
+                updated_at = datetime.fromtimestamp(
+                    float(updated_at), tz=self.TZ_CN
+                ).strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 updated_at = str(updated_at)
 
@@ -776,21 +817,42 @@ class SiQiRestaurantV3(_PluginBase):
 
         served_today = max(0, self.__safe_int(state.get("customers_served"), 0))
         total_today = max(0, self.__safe_int(state.get("customers_total"), 0))
-        return [
-            self.__hero_card(
-                state,
-                served_today,
-                total_today,
-                schedule_info,
-                updated_at,
-                daily.get("last_result", "") or state.get("last_message", ""),
-            ),
-            self.__today_overview_card(),
-            self.__quick_actions_card(),
-            self.__strategy_tuning_card(),
-            self.__log_table(state.get("logs") or daily.get("history") or []),
-            self.__strategy_summary_card(),
-        ]
+
+        cards: List[dict] = []
+        if not self._enabled:
+            cards.append(
+                self.__alert(
+                    "插件未启用：定时任务不会运行，以下为历史数据快照。", "warning"
+                )
+            )
+        if is_stale:
+            cards.append(
+                self.__alert(
+                    f"数据日期 {data_date or '未知'} ≠ 今天 {today}，"
+                    "以下为上次运行快照；点「仅同步状态」刷新。",
+                    "warning",
+                )
+            )
+        cards.extend(
+            [
+                self.__hero_card(
+                    state,
+                    served_today,
+                    total_today,
+                    schedule_info,
+                    updated_at,
+                    daily.get("last_result", "") or state.get("last_message", ""),
+                    stale=is_stale,
+                    data_date=data_date,
+                ),
+                self.__today_overview_card(stale=is_stale, data_date=data_date),
+                self.__quick_actions_card(),
+                self.__strategy_tuning_card(),
+                self.__log_table(state.get("logs") or daily.get("history") or []),
+                self.__strategy_summary_card(),
+            ]
+        )
+        return cards
 
     def stop_service(self):
         """移除全部一次性任务并释放并发锁，可重复安全调用。"""
@@ -1024,6 +1086,8 @@ class SiQiRestaurantV3(_PluginBase):
         schedule_info: str,
         updated_at: str,
         last_result: str,
+        stale: bool = False,
+        data_date: str = "",
     ) -> Dict[str, Any]:
         """Hero 卡：魔力值/受欢迎值/今日顾客/净收益；渐变由原生 div 承载。"""
         pill_style = (
@@ -1041,12 +1105,17 @@ class SiQiRestaurantV3(_PluginBase):
             {
                 "component": "span",
                 "props": {"style": pill_style},
-                "text": f"🔥 受欢迎 {popularity:,}",
+                "text": (
+                    f"🔥 受欢迎 {popularity:,}"
+                    + (f"（{data_date}）" if stale else "")
+                ),
             },
             {
                 "component": "span",
                 "props": {"style": pill_style},
-                "text": f"💰 魔力 {magic:,}",
+                "text": (
+                    f"💰 魔力 {magic:,}" + (f"（{data_date}）" if stale else "")
+                ),
             },
         ]
         if self._dry_run:
@@ -1069,6 +1138,18 @@ class SiQiRestaurantV3(_PluginBase):
             if last_result:
                 summary += f" ｜ 📝 {last_result}"
 
+        if stale:
+            label_text = "今日尚未经营"
+            primary_text = "—"
+            sub_text = (
+                f"上次经营 {data_date or '未知'}（{served_today}/{total_today}）"
+                " · 今日净收益 —"
+            )
+        else:
+            label_text = "今日顾客（已服务/总数）"
+            primary_text = f"{served_today}/{total_today}"
+            sub_text = f"剩余顾客 {remaining} · 今日净收益 {net_earned:,}"
+
         content: List[Dict[str, Any]] = [
             {
                 "component": "div",
@@ -1078,17 +1159,17 @@ class SiQiRestaurantV3(_PluginBase):
             {
                 "component": "div",
                 "props": {"style": "font-size: 13px; opacity: 0.9; margin-top: 8px;"},
-                "text": "今日顾客（已服务/总数）",
+                "text": label_text,
             },
             {
                 "component": "div",
                 "props": {"style": "font-size: 44px; font-weight: 800; line-height: 1.1;"},
-                "text": f"{served_today}/{total_today}",
+                "text": primary_text,
             },
             {
                 "component": "div",
                 "props": {"style": "font-size: 13px; opacity: 0.9; margin: 4px 0 10px 0;"},
-                "text": f"剩余顾客 {remaining} · 今日净收益 {net_earned:,}",
+                "text": sub_text,
             },
             {"component": "div", "props": {"style": "margin-bottom:8px;"}, "content": pills},
             {
@@ -1119,26 +1200,49 @@ class SiQiRestaurantV3(_PluginBase):
             "content": content,
         }
 
-    def __today_overview_card(self) -> Dict[str, Any]:
+    def __today_overview_card(
+        self, stale: bool = False, data_date: str = ""
+    ) -> Dict[str, Any]:
         """今日概览卡：状态、剩余顾客、下馆子次数与食材库存。"""
         state = self._state or {}
         daily = self._daily or {}
-        status = state.get("session_status") or "ready"
-        status_text = {"ready": "未开店", "open": "营业中", "closed": "已打烊"}.get(
-            status, str(status)
-        )
-        status_color = {"open": "success", "closed": "secondary"}.get(status, "primary")
+        if stale:
+            status_text = "待同步"
+            status_color = "warning"
+        else:
+            status = state.get("session_status") or "ready"
+            status_text = {"ready": "未开店", "open": "营业中", "closed": "已打烊"}.get(
+                status, str(status)
+            )
+            status_color = {"open": "success", "closed": "secondary"}.get(
+                status, "primary"
+            )
 
-        remaining = max(0, self.__safe_int(state.get("customers_remaining"), 0))
-        queued = max(0, self.__safe_int(state.get("queued_customers"), 0))
-        visits = self._state.get("visits") or {}
-        visit_used = max(0, self.__safe_int(daily.get("visits"), 0))
-        visit_limit = max(0, self.__safe_int(visits.get("limit"), self._visit_count_limit))
-        visit_remaining = self.__safe_int(visits.get("remaining"), None)
-        ingredients = state.get("ingredients") or {}
-        ing_total = sum(max(0, self.__safe_int(v, 0)) for v in ingredients.values())
         popularity = max(0, self.__safe_int(state.get("popularity"), 0))
-        cur_date = state.get("cur_date") or "未知"
+        if stale:
+            tile_remaining = "—"
+            tile_queued = "—"
+            tile_visit = "—"
+            tile_ing = "—"
+            visit_remaining = None
+            cur_date = data_date or state.get("cur_date") or "未知"
+        else:
+            remaining = max(0, self.__safe_int(state.get("customers_remaining"), 0))
+            queued = max(0, self.__safe_int(state.get("queued_customers"), 0))
+            visit_used = max(0, self.__safe_int(daily.get("visits"), 0))
+            visit_limit = max(0, self.__safe_int(self._visit_count_limit, 0))
+            visit_remaining = max(0, visit_limit - visit_used) if visit_limit else None
+            ingredients = state.get("ingredients") or {}
+            ing_total = sum(
+                max(0, self.__safe_int(v, 0)) for v in ingredients.values()
+            )
+            tile_remaining = f"{remaining}"
+            tile_queued = f"{queued}"
+            tile_visit = f"{visit_used}/{visit_limit or '?'}"
+            tile_ing = f"{ing_total}"
+            cur_date = state.get("cur_date") or "未知"
+
+        date_suffix = "（非今天）" if stale else ""
 
         return {
             "component": "VCard",
@@ -1167,14 +1271,10 @@ class SiQiRestaurantV3(_PluginBase):
                         {
                             "component": "VRow",
                             "content": [
-                                self.__tile("👥", f"{remaining}", "剩余顾客"),
-                                self.__tile("⏳", f"{queued}", "排队顾客"),
-                                self.__tile(
-                                    "🍽️",
-                                    f"{visit_used}/{visit_limit or '?'}",
-                                    "今日下馆子",
-                                ),
-                                self.__tile("🥕", f"{ing_total}", "食材库存"),
+                                self.__tile("👥", tile_remaining, "剩余顾客"),
+                                self.__tile("⏳", tile_queued, "排队顾客"),
+                                self.__tile("🍽️", tile_visit, "今日下馆子"),
+                                self.__tile("🥕", tile_ing, "食材库存"),
                             ],
                         },
                         {
@@ -1183,7 +1283,7 @@ class SiQiRestaurantV3(_PluginBase):
                             "text": (
                                 f"受欢迎值 {popularity:,} · 站点剩余下馆子 "
                                 f"{visit_remaining if visit_remaining is not None else '?'}"
-                                f" · 日期 {cur_date}"
+                                f" · 日期 {cur_date}{date_suffix}"
                             ),
                         },
                     ],
@@ -1573,8 +1673,21 @@ class SiQiRestaurantV3(_PluginBase):
 
     async def api_status(self) -> Dict[str, Any]:
         """API：返回今日统计与运行态快照。"""
+        today = self.__today_cn()
+        state_date = str((self._state or {}).get("cur_date") or "")
+        data_date = state_date or str((self._daily or {}).get("date") or "")
+        is_stale = (not data_date) or (data_date != today)
         return self.__api_response(
-            True, "已获取状态", {"daily": self._daily, "state": self._state}
+            True,
+            "已获取状态",
+            {
+                "daily": self._daily,
+                "state": self._state,
+                "enabled": bool(self._enabled),
+                "today": today,
+                "state_date": state_date,
+                "is_stale": is_stale,
+            },
         )
 
     async def api_serve_now(
@@ -1904,10 +2017,18 @@ class SiQiRestaurantV3(_PluginBase):
             0, self.__safe_int(self._state.get("net_earnings_today"), 0)
         )
         summary = self.__build_summary(served)
-        # P1-3：收尾状态分级：remaining<=0 → completed；served>0 → partial；否则 failed
+        # P1-3：收尾状态分级：站点已打烊且非插件开店 → completed（不打失败通知）
         remaining = self.__safe_int(self._state.get("customers_remaining"), 0)
         self._daily["completed"] = remaining <= 0
-        if remaining <= 0:
+        if (
+            self._state.get("session_status") == "closed"
+            and self.__safe_int(self._daily.get("sessions"), 0) == 0
+            and served == 0
+        ):
+            status = "completed"
+            result["silent"] = True
+            summary = f"今日餐馆已打烊（非插件开店）：{summary}"
+        elif remaining <= 0:
             status = "completed"
         elif served > 0:
             status = "partial"
@@ -2902,18 +3023,10 @@ class SiQiRestaurantV3(_PluginBase):
             self._daily = self.__roll_daily(self._daily, text)
 
     def __extract_visit_targets(self, payload: Dict[str, Any]) -> List[str]:
-        """从可拜访列表回包中提取用户名列表（兼容多种结构）。"""
+        """从可拜访列表回包中提取用户名列表（只认 restaurants/targets/data）。"""
         if not isinstance(payload, dict):
             return []
         candidates: List[Any] = []
-        visits = payload.get("visits")
-        if isinstance(visits, dict):
-            for field in ("records", "list", "pending_visitors"):
-                value = visits.get(field)
-                if isinstance(value, dict):
-                    candidates.extend(value.get("list") or [])
-                elif isinstance(value, list):
-                    candidates.extend(value)
         for field in ("restaurants", "targets", "data"):
             value = payload.get(field)
             if isinstance(value, list):
