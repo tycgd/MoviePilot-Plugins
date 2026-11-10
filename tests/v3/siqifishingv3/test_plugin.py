@@ -344,7 +344,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.3.0"
+    assert cls.plugin_version == "1.3.1"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -416,7 +416,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.3.0"
+    assert cls.plugin_version == "1.3.1"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1740,6 +1740,7 @@ def _task_plugin(module, monkeypatch, *, tasks, task_defs, fish, codex=None):
 _COLLECTION_DEFS = {
     "1": {
         "repeatable": False,
+        "rewards": {"unlock_rod": "green_leaf"},
         "requirements": [
             {"code": 1, "quantity": 1},
             {"code": 103, "quantity": 1},
@@ -1856,6 +1857,7 @@ def test_task_gap_text_lists_missing_species(monkeypatch):
     task_defs = {
         "1": {
             "repeatable": False,
+            "rewards": {"unlock_rod": "green_leaf"},
             "requirements": [
                 {"code": 1, "quantity": 1},
                 {"code": 103, "quantity": 1},
@@ -1887,6 +1889,59 @@ def test_task_gap_text_lists_missing_species(monkeypatch):
     assert "凤尾鱼" in text and "时段5" in text, text
     assert "萨帕塔鱼" in text and "时段3" in text, text
     assert "code#37" in text, text
+
+
+def test_task6_without_rod_reward_not_protected(monkeypatch):
+    """非鱼竿奖励的收集任务（任务六）不进入保护集合，也不出现在缺口文案。"""
+    module = load_plugin_module()
+    tasks = {
+        "1": {"progress": {"ready": False}, "status": "in_progress"},
+        "6": {"progress": {"ready": False}, "status": "in_progress"},
+        "7": {"progress": {"ready": True}, "status": "in_progress"},
+    }
+    task_defs = {
+        "1": {
+            "repeatable": False,
+            "rewards": {"unlock_rod": "green_leaf"},
+            "requirements": [
+                {"code": 1, "quantity": 1},
+                {"code": 103, "quantity": 1},
+                {"code": 37, "quantity": 1},
+                {"code": 93, "quantity": 1},
+                {"code": 555, "quantity": 1},
+            ],
+        },
+        "6": {
+            "repeatable": False,
+            "rewards": {"medal": 12},
+            "requirements": [
+                {"code": 999, "quantity": 1},
+                {"code": 998, "quantity": 1},
+                {"code": 997, "quantity": 1},
+                {"code": 996, "quantity": 1},
+                {"code": 995, "quantity": 1},
+            ],
+        },
+        "7": {
+            "repeatable": True,
+            "requirements": [{"code": 1, "quantity": 1}],
+        },
+    }
+    plugin = _task_plugin(
+        module,
+        monkeypatch,
+        tasks=tasks,
+        task_defs=task_defs,
+        fish={"1": 1},
+        codex=[{"code": 1, "name": "凤尾鱼", "time_slot": 5}],
+    )
+
+    protected = plugin._SiQiFishingV3__protected_collection_codes()
+    assert "999" not in protected, protected
+    assert "1" in protected, protected
+    text = plugin._SiQiFishingV3__task_gap_text()
+    assert "任务六" not in text, text
+    assert "任务一" in text, text
 
 
 def test_page_lure_buttons_disabled_without_stock():

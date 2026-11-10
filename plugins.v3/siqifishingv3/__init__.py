@@ -26,7 +26,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -2642,6 +2642,9 @@ class SiQiFishingV3(_PluginBase):
                 continue
             if defn.get("repeatable"):
                 continue
+            rewards = defn.get("rewards") or {}
+            if not isinstance(rewards, dict) or not rewards.get("unlock_rod"):
+                continue  # 只保护解锁鱼竿的收集任务，避免任务六（全图鉴）无限期拦截可重复任务
             status = str(self.__task_state(task_id).get("status") or "").strip()
             if status == "completed":
                 continue
@@ -2673,6 +2676,9 @@ class SiQiFishingV3(_PluginBase):
                 continue
             if defn.get("repeatable"):
                 continue
+            rewards = defn.get("rewards") or {}
+            if not isinstance(rewards, dict) or not rewards.get("unlock_rod"):
+                continue  # 只展示解锁鱼竿任务（任务一~五）的缺口
             status = str(self.__task_state(task_id).get("status") or "").strip()
             if status == "completed":
                 continue
