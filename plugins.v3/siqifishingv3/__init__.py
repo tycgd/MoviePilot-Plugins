@@ -26,7 +26,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -45,6 +45,10 @@ class SiQiFishingV3(_PluginBase):
 
     FISHING_DATA_MARKER = "const FISHING_DATA = "
     DAILY_HISTORY_LIMIT = 30
+
+    # 收集类任务保护：避免自动交付可重复小任务消耗收集任务必需的鱼
+    PROTECT_COLLECTION_TASKS = True
+    COLLECTION_TASK_MIN_REQUIREMENTS = 5
 
     # 滑轨甜蜜区：页面 CSS 中 40%-60% 为深蓝色，50% 颜色最深
     PERFECT_MIN = 0.45
@@ -1007,6 +1011,9 @@ class SiQiFishingV3(_PluginBase):
                             self.__strategy_row("时段分配", slot_info),
                             self.__strategy_row(
                                 "演练模式", "开启（只同步不抛竿）" if self._dry_run else "关闭"
+                            ),
+                            self.__strategy_row(
+                                "任务缺口", self.__task_gap_text() or "无"
                             ),
                         ],
                     },
@@ -2337,6 +2344,9 @@ class SiQiFishingV3(_PluginBase):
             summary += f"，交付任务 {result['data']['delivered']} 个"
         if cast_result.get("failure"):
             summary += f"；停止原因：{cast_result['failure']}"
+        gap = self.__task_gap_text()
+        if gap:
+            summary += f"；任务缺口：{gap}"
 
         result["status"] = cast_result["status"]
         result["message"] = summary
@@ -2559,16 +2569,180 @@ class SiQiFishingV3(_PluginBase):
             if isinstance(payload.get("data"), dict):
                 self.__apply_state(payload["data"])
 
+    @staticmethod
+    def __task_cn_name(task_id: Any) -> str:
+        """任务编号 → 中文任务名（一~十三），未知回退为原编号。"""
+        numerals = {
+            1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六",
+            7: "七", 8: "八", 9: "九", 10: "十", 11: "十一", 12: "十二", 13: "十三",
+        }
+        number = SiQiFishingV3.__safe_int(task_id, -1)
+        return f"任务{numerals.get(number, str(task_id if task_id is not None else ''))}"
+
+    def __task_def(self, task_id: Any) -> Dict[str, Any]:
+        """按任务编号取任务定义，兼容 int/str 键。"""
+        defs = self._state.get("task_defs") or {}
+        if not isinstance(defs, dict):
+            return {}
+        for key in (task_id, str(task_id)):
+            if key in defs and isinstance(defs[key], dict):
+                return defs[key]
+        try:
+            int_key = int(task_id)
+        except (TypeError, ValueError):
+            return {}
+        if int_key in defs and isinstance(defs[int_key], dict):
+            return defs[int_key]
+        return {}
+
+    def __task_state(self, task_id: Any) -> Dict[str, Any]:
+        """按任务编号取任务进度，兼容 int/str 键。"""
+        tasks = self._state.get("tasks") or {}
+        if not isinstance(tasks, dict):
+            return {}
+        for key in (task_id, str(task_id)):
+            if key in tasks and isinstance(tasks[key], dict):
+                return tasks[key]
+        try:
+            int_key = int(task_id)
+        except (TypeError, ValueError):
+            return {}
+        if int_key in tasks and isinstance(tasks[int_key], dict):
+            return tasks[int_key]
+        return {}
+
+    @staticmethod
+    def __task_required_codes(task_def: Any) -> List[str]:
+        """提取任务 requirements 中所有 code 的字符串列表。"""
+        if not isinstance(task_def, dict):
+            return []
+        codes: List[str] = []
+        for req in task_def.get("requirements") or []:
+            if isinstance(req, dict) and req.get("code") is not None:
+                codes.append(str(req.get("code")))
+        return codes
+
+    def __fish_qty(self, code: Any) -> int:
+        """取某鱼 code 的库存数量。"""
+        fish = self._state.get("fish") or {}
+        if not isinstance(fish, dict):
+            return 0
+        return self.__safe_int(fish.get(str(code)), 0)
+
+    def __protected_collection_codes(self) -> set:
+        """收集任务保护：返回所有未完成的非重复收集任务所需鱼 code 集合。"""
+        if not self.PROTECT_COLLECTION_TASKS:
+            return set()
+        defs = self._state.get("task_defs") or {}
+        if not isinstance(defs, dict):
+            return set()
+        codes: set = set()
+        for task_id, defn in defs.items():
+            if not isinstance(defn, dict):
+                continue
+            if defn.get("repeatable"):
+                continue
+            status = str(self.__task_state(task_id).get("status") or "").strip()
+            if status == "completed":
+                continue
+            requirements = defn.get("requirements") or []
+            if not isinstance(requirements, list):
+                continue
+            if len(requirements) < self.COLLECTION_TASK_MIN_REQUIREMENTS:
+                continue
+            codes.update(self.__task_required_codes(defn))
+        return codes
+
+    def __task_gap_text(self, limit: int = 3) -> str:
+        """汇总非重复未完成收集任务的缺口：缺哪种鱼、需求时段。"""
+        defs = self._state.get("task_defs") or {}
+        if not isinstance(defs, dict):
+            return ""
+        codex_items = self._state.get("codex_items") or []
+        name_map: Dict[str, Dict[str, Any]] = {}
+        if isinstance(codex_items, list):
+            for item in codex_items:
+                if isinstance(item, dict) and item.get("code") is not None:
+                    name_map[str(item.get("code"))] = item
+
+        limit = self.__safe_int(limit, 3, 1)
+        parts: List[str] = []
+        for task_id in sorted(defs, key=lambda x: self.__safe_int(x, 0)):
+            defn = defs.get(task_id)
+            if not isinstance(defn, dict):
+                continue
+            if defn.get("repeatable"):
+                continue
+            status = str(self.__task_state(task_id).get("status") or "").strip()
+            if status == "completed":
+                continue
+            requirements = defn.get("requirements") or []
+            if not isinstance(requirements, list):
+                continue
+            if len(requirements) < self.COLLECTION_TASK_MIN_REQUIREMENTS:
+                continue
+            missing: List[str] = []
+            for req in requirements:
+                if not isinstance(req, dict) or req.get("code") is None:
+                    continue
+                code = str(req.get("code"))
+                need = self.__safe_int(req.get("quantity"), 1, 1)
+                if self.__fish_qty(code) >= need:
+                    continue
+                meta = name_map.get(code) or {}
+                name = str(meta.get("name") or "").strip()
+                if not name or name == "未知":
+                    name = f"code#{code}"
+                slot = meta.get("time_slot")
+                slot_text = "" if slot is None or str(slot) == "" else f"(时段{slot})"
+                missing.append(f"{name}{slot_text}")
+            if missing:
+                parts.append(
+                    f"{self.__task_cn_name(task_id)} 缺 " + "、".join(missing)
+                )
+            if len(parts) >= limit:
+                break
+        return "；".join(parts)
+
     async def __deliver_tasks(self, client: AsyncRequestUtils) -> int:
         tasks = self._state.get("tasks") or {}
         delivered = 0
-        for task_id in sorted(tasks, key=lambda x: self.__safe_int(x, 0)):
+        protected = (
+            self.__protected_collection_codes()
+            if self.PROTECT_COLLECTION_TASKS
+            else set()
+        )
+        ordered = sorted(
+            tasks,
+            key=lambda tid: (
+                1 if (self.__task_def(tid) or {}).get("repeatable") else 0,
+                self.__safe_int(tid, 0),
+            ),
+        )
+        for task_id in ordered:
             info = tasks.get(task_id)
             if not isinstance(info, dict):
                 continue
             progress = info.get("progress") or {}
             if not progress.get("ready"):
                 continue
+            defn = self.__task_def(task_id)
+            if self.PROTECT_COLLECTION_TASKS and defn.get("repeatable"):
+                blocked_code = ""
+                for req in defn.get("requirements") or []:
+                    if not isinstance(req, dict) or req.get("code") is None:
+                        continue
+                    code = str(req.get("code"))
+                    need = self.__safe_int(req.get("quantity"), 1, 1)
+                    if code in protected and self.__fish_qty(code) <= need:
+                        blocked_code = code
+                        break
+                if blocked_code:
+                    self.__record(
+                        "skip",
+                        f"跳过交付任务 {task_id}：会消耗收集任务必需的鱼 {blocked_code}",
+                    )
+                    continue
             payload = await self.__post_action(
                 client, "deliver_task", task_id=self.__safe_int(task_id, 0)
             )
@@ -2837,6 +3011,19 @@ class SiQiFishingV3(_PluginBase):
                 config.get("guessRewardAttempts"), 0
             ),
             "tasks": tasks,
+            "fish": {
+                str(code): SiQiFishingV3.__safe_int(
+                    (
+                        value.get("quantity")
+                        if isinstance(value, dict)
+                        else value
+                    ),
+                    0,
+                )
+                for code, value in (inventory.get("fish") or {}).items()
+            },
+            "task_defs": config.get("tasks") or {},
+            "codex_items": codex if isinstance(codex, list) else [],
             "tasks_ready": sum(
                 1
                 for info in tasks.values()

@@ -344,7 +344,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.2.0"
+    assert cls.plugin_version == "1.3.0"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -416,7 +416,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.2.0"
+    assert cls.plugin_version == "1.3.0"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1723,6 +1723,170 @@ def test_deliver_only_ready_tasks(monkeypatch):
     ]
     assert len(bodies) == 1
     assert str(bodies[0].get("task_id")) == "1"
+
+
+def _task_plugin(module, monkeypatch, *, tasks, task_defs, fish, codex=None):
+    """构造带任务定义/进度/鱼库存的插件，隔离网络与站点。"""
+    _stub_runtime(monkeypatch, module, data=make_data(tasks=tasks))
+    plugin = build_plugin(module)
+    plugin._state["tasks"] = tasks
+    plugin._state["task_defs"] = task_defs
+    plugin._state["fish"] = fish
+    if codex is not None:
+        plugin._state["codex_items"] = codex
+    return plugin
+
+
+_COLLECTION_DEFS = {
+    "1": {
+        "repeatable": False,
+        "requirements": [
+            {"code": 1, "quantity": 1},
+            {"code": 103, "quantity": 1},
+            {"code": 37, "quantity": 1},
+            {"code": 93, "quantity": 1},
+            {"code": 555, "quantity": 1},
+        ],
+    },
+    "7": {
+        "repeatable": True,
+        "requirements": [
+            {"code": 1, "quantity": 1},
+            {"code": 2, "quantity": 1},
+            {"code": 3, "quantity": 1},
+        ],
+    },
+}
+
+
+def test_deliver_skips_repeatable_task_consuming_collection_fish(monkeypatch):
+    """可重复任务的交付会消耗收集任务必需的鱼时，应跳过并记录 skip。"""
+    module = load_plugin_module()
+    tasks = {
+        "1": {"progress": {"ready": False}, "status": "in_progress"},
+        "7": {"progress": {"ready": True}, "status": "in_progress"},
+    }
+    plugin = _task_plugin(
+        module,
+        monkeypatch,
+        tasks=tasks,
+        task_defs=_COLLECTION_DEFS,
+        fish={"1": 1, "2": 1, "3": 1, "103": 0},
+    )
+    ActionRequestUtils.reset(
+        responses={"deliver_task": [FakeResponse(payload={"success": True}) for _ in range(3)]}
+    )
+
+    delivered = asyncio.run(
+        plugin._SiQiFishingV3__deliver_tasks(ActionRequestUtils())
+    )
+
+    assert delivered == 0, delivered
+    assert "deliver_task" not in ActionRequestUtils.actions, ActionRequestUtils.actions
+    detail = json.dumps(plugin._daily["history"], ensure_ascii=False)
+    assert "跳过交付任务 7" in detail, detail
+    assert "skip" in [item.get("action") for item in plugin._daily["history"]]
+
+
+def test_deliver_allows_repeatable_when_surplus(monkeypatch):
+    """收集任务所需的鱼有富余时，允许交付可重复任务。"""
+    module = load_plugin_module()
+    tasks = {
+        "1": {"progress": {"ready": False}, "status": "in_progress"},
+        "7": {"progress": {"ready": True}, "status": "in_progress"},
+    }
+    plugin = _task_plugin(
+        module,
+        monkeypatch,
+        tasks=tasks,
+        task_defs=_COLLECTION_DEFS,
+        fish={"1": 2, "2": 1, "3": 1, "103": 0},
+    )
+    ActionRequestUtils.reset(
+        responses={"deliver_task": [FakeResponse(payload={"success": True})]}
+    )
+
+    delivered = asyncio.run(
+        plugin._SiQiFishingV3__deliver_tasks(ActionRequestUtils())
+    )
+
+    assert delivered == 1, delivered
+    bodies = [
+        body for action, body in ActionRequestUtils.calls if action == "deliver_task"
+    ]
+    assert len(bodies) == 1, bodies
+    assert str(bodies[0].get("task_id")) == "7"
+
+
+def test_deliver_prefers_non_repeatable_first(monkeypatch):
+    """交付顺序应优先非重复收集任务，再处理可重复任务。"""
+    module = load_plugin_module()
+    tasks = {
+        "1": {"progress": {"ready": True}},
+        "7": {"progress": {"ready": True}},
+    }
+    plugin = _task_plugin(
+        module,
+        monkeypatch,
+        tasks=tasks,
+        task_defs=_COLLECTION_DEFS,
+        fish={"1": 5, "2": 5, "3": 5, "103": 5},
+    )
+    ActionRequestUtils.reset(
+        responses={"deliver_task": [FakeResponse(payload={"success": True}) for _ in range(3)]}
+    )
+
+    delivered = asyncio.run(
+        plugin._SiQiFishingV3__deliver_tasks(ActionRequestUtils())
+    )
+
+    assert delivered == 2, delivered
+    order = [
+        str(body.get("task_id"))
+        for action, body in ActionRequestUtils.calls
+        if action == "deliver_task"
+    ]
+    assert order == ["1", "7"], order
+
+
+def test_task_gap_text_lists_missing_species(monkeypatch):
+    """任务缺口文案应列出缺失鱼种与需求时段。"""
+    module = load_plugin_module()
+    tasks = {"1": {"progress": {"ready": False}, "status": "in_progress"}}
+    task_defs = {
+        "1": {
+            "repeatable": False,
+            "requirements": [
+                {"code": 1, "quantity": 1},
+                {"code": 103, "quantity": 1},
+                {"code": 37, "quantity": 1},
+                {"code": 93, "quantity": 1},
+                {"code": 555, "quantity": 1},
+            ],
+        },
+    }
+    codex = [
+        {"code": 1, "name": "凤尾鱼", "rarity": "普通", "time_slot": 5, "discovered": True},
+        {"code": 103, "name": "萨帕塔鱼", "rarity": "稀有", "time_slot": 3, "discovered": False},
+        {"code": 37, "name": "未知", "time_slot": 1},
+        {"code": 93, "name": "未知", "time_slot": 6},
+        {"code": 555, "name": "测试鱼", "time_slot": 2},
+    ]
+    plugin = _task_plugin(
+        module,
+        monkeypatch,
+        tasks=tasks,
+        task_defs=task_defs,
+        fish={"555": 1},
+        codex=codex,
+    )
+
+    text = plugin._SiQiFishingV3__task_gap_text()
+
+    assert "任务一" in text, text
+    assert "凤尾鱼" in text and "时段5" in text, text
+    assert "萨帕塔鱼" in text and "时段3" in text, text
+    assert "code#37" in text, text
 
 
 def test_page_lure_buttons_disabled_without_stock():
