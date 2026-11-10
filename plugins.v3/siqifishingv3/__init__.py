@@ -26,7 +26,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -2315,6 +2315,60 @@ class SiQiFishingV3(_PluginBase):
             self.__record("sync", result["message"])
             return
 
+        # 本时段配额已用完且没有可交付任务时，静默跳过：不抛竿、不写 run 记录、不发通知。
+        tasks_ready = sum(
+            1
+            for info in (self._state.get("tasks") or {}).values()
+            if isinstance(info, dict) and (info.get("progress") or {}).get("ready")
+        )
+        if tasks_ready == 0:
+            now_cn = datetime.now(self.TZ_CN)
+            slot_no = self.__time_slot(now_cn.hour)
+            slots_map = self._daily.get("slots")
+            slot_used = self.__safe_int(
+                (slots_map or {}).get(str(slot_no))
+                if isinstance(slots_map, dict)
+                else 0,
+                0,
+            )
+            attempts_used_now = self.__safe_int(self._state.get("attempts_used"), 0)
+            attempts_limit_now = self.__safe_int(self._state.get("attempts_limit"), 0)
+            plugin_casts_now = self.__safe_int(self._daily.get("casts"), 0)
+            allowed_now = self.__plan_slot_casts(
+                strategy=self._slot_strategy,
+                site_used=attempts_used_now,
+                site_limit=attempts_limit_now,
+                plugin_casts=plugin_casts_now,
+                daily_limit=self._daily_cast_limit,
+                slot=slot_no,
+                slot_used=slot_used,
+                per_slot=self._per_slot_casts,
+                max_per_run=self._max_casts_per_run,
+            )
+            if allowed_now <= 0:
+                remaining_now = self.__remaining_casts(
+                    attempts_used_now,
+                    attempts_limit_now,
+                    plugin_casts_now,
+                    self._daily_cast_limit,
+                )
+                result["status"] = "completed"
+                result["silent"] = True
+                if remaining_now <= 0:
+                    result["message"] = "今日钓鱼次数已用完，静默跳过"
+                else:
+                    result["message"] = (
+                        self.__slot_exhausted_reason(
+                            attempts_used_now,
+                            attempts_limit_now,
+                            plugin_casts_now,
+                            slot_no,
+                            slot_used,
+                        )
+                        + "，静默跳过"
+                    )
+                return
+
         if allow_guess and self._auto_guess:
             await self.__submit_guess(client)
 
@@ -3398,7 +3452,7 @@ class SiQiFishingV3(_PluginBase):
         }
 
     def __finish_task(self, result: Dict[str, Any]) -> None:
-        if self._notify:
+        if self._notify and not result.get("silent"):
             self.__send_notification(result)
         self._state["last_message"] = result.get("message", "")
         self.__save_state()

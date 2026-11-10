@@ -344,7 +344,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.3.1"
+    assert cls.plugin_version == "1.3.2"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -416,7 +416,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.3.1"
+    assert cls.plugin_version == "1.3.2"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1889,6 +1889,56 @@ def test_task_gap_text_lists_missing_species(monkeypatch):
     assert "凤尾鱼" in text and "时段5" in text, text
     assert "萨帕塔鱼" in text and "时段3" in text, text
     assert "code#37" in text, text
+
+
+def test_execute_silent_skip_when_slot_exhausted(monkeypatch):
+    """时段配额用完且无可交付任务时，应静默跳过，不抛竿也不写 run 记录。"""
+    module = load_plugin_module()
+    slot = _current_slot(module)
+
+    def configure(plugin):
+        plugin._auto_guess = False
+        plugin._auto_task = True
+        plugin._slot_strategy = "auto"
+        plugin._daily["date"] = _today(module)
+        plugin._daily["slots"] = {str(slot): 99}
+
+    plugin, result = _run_task(module, monkeypatch, configure=configure)
+
+    assert result["status"] == "completed", result
+    assert result.get("silent") is True
+    assert "perform_fishing" not in ActionRequestUtils.actions
+    assert "deliver_task" not in ActionRequestUtils.actions
+    assert all(item.get("action") != "run" for item in plugin._daily["history"])
+
+
+def test_execute_still_delivers_ready_tasks_when_slot_exhausted(monkeypatch):
+    """即使时段配额用完，只要任务可交付，仍应继续交付而不是静默退出。"""
+    module = load_plugin_module()
+    slot = _current_slot(module)
+    data = make_data(tasks={"1": {"progress": {"ready": True}, "status": "in_progress"}})
+
+    def configure(plugin):
+        plugin._auto_guess = False
+        plugin._auto_task = True
+        plugin._slot_strategy = "auto"
+        plugin._daily["date"] = _today(module)
+        plugin._daily["slots"] = {str(slot): 99}
+        plugin._state["task_defs"] = {
+            "1": {"repeatable": False, "requirements": [{"code": 1, "quantity": 1}]}
+        }
+        plugin._state["fish"] = {"1": 1}
+
+    plugin, result = _run_task(
+        module,
+        monkeypatch,
+        data=data,
+        responses={"deliver_task": [FakeResponse(payload={"success": True})]},
+        configure=configure,
+    )
+
+    assert "deliver_task" in ActionRequestUtils.actions
+    assert result["status"] in ("completed", "partial"), result
 
 
 def test_task6_without_rod_reward_not_protected(monkeypatch):
