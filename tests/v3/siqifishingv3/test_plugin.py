@@ -345,7 +345,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.3.4"
+    assert cls.plugin_version == "1.3.5"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -417,7 +417,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.3.4"
+    assert cls.plugin_version == "1.3.5"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1000,7 +1000,7 @@ def test_api_status_envelope():
 
 
 def test_api_responses_are_envelopes(monkeypatch):
-    """get_api 暴露的 6 个端点都返回 success/message/data 三键外壳。"""
+    """get_api 暴露的 8 个端点都返回 success/message/data 三键外壳。"""
     module = load_plugin_module()
     monkeypatch.setattr(module, "AsyncRequestUtils", ActionRequestUtils)
     monkeypatch.setattr(module, "SiteOper", StubSiteOper)
@@ -1016,10 +1016,12 @@ def test_api_responses_are_envelopes(monkeypatch):
         "/sync": None,
         "/set_option": {"key": "dry_run", "value": True},
         "/deliver": None,
+        "/slot_mode": {"mode": "auto"},
+        "/adjust_slot": {"slot": 1, "delta": 1},
     }
 
     apis = plugin.get_api()
-    assert len(apis) == 6
+    assert len(apis) == 8
     for api in apis:
         plugin._lock = None
         payload = payloads[api["path"]]
@@ -2332,7 +2334,9 @@ def test_plan_site_used_dominates():
 
 def test_slot_grid_shape():
     """6 格时段网格标出当前格、配额与未来格。"""
-    grid_fn = _slot_static("slot_grid")
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    grid_fn = getattr(plugin, "_SiQiFishingV3__slot_grid")
     grid = grid_fn({"1": 6, "2": 6}, 3, "auto", 8, 6)
 
     assert isinstance(grid, list)
@@ -2674,8 +2678,8 @@ def test_form_slot_strategy_has_plan_option(monkeypatch):
     assert "plan" in values
 
 
-def test_init_slot_plan_forces_plan_strategy(monkeypatch):
-    """有效 slot_plan 强制切换到 plan；plan 为空时回退 auto。"""
+def test_init_slot_plan_does_not_force_plan(monkeypatch):
+    """填写计划不再强制切 plan：保留用户所选 auto；plan+空计划仍回退 auto。"""
     module = load_plugin_module()
     monkeypatch.setattr(module, "SiteOper", StubSiteOper)
     monkeypatch.setattr(
@@ -2686,7 +2690,7 @@ def test_init_slot_plan_forces_plan_strategy(monkeypatch):
     plugin.init_plugin(
         {"enabled": True, "slot_strategy": "auto", "slot_plan": "0,0,8,0,10,0"}
     )
-    assert plugin._slot_strategy == "plan"
+    assert plugin._slot_strategy == "auto"
     assert plugin._slot_plan == [0, 0, 8, 0, 10, 0]
 
     plugin_empty = build_plugin(module)
@@ -2754,6 +2758,325 @@ def test_slot_plan_page_summary():
 
     assert "自定义计划" in page_text
     assert "0/0/8/0/10/0" in page_text
+
+
+# ---------------------------------------------------------------------------
+# v1.3.5：详情页内分时段设置（slot_mode / adjust_slot）
+# ---------------------------------------------------------------------------
+
+
+def test_slot_mode_persists_auto_and_plan(monkeypatch):
+    """slot_mode 切换 auto/plan 时持久化 slot_strategy+slot_plan 并同步内存。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "auto"
+    plugin._slot_plan = [1, 2, 3, 4, 5, 6]
+    plugin._slot_plan_text = "1,2,3,4,5,6"
+
+    result = asyncio.run(plugin.api_slot_mode({"mode": "plan"}))
+    assert result["success"] is True, result
+    assert set(result) == {"success", "message", "data"}
+    assert plugin._slot_strategy == "plan"
+    assert plugin._slot_plan == [1, 2, 3, 4, 5, 6]
+    assert result["data"]["mode"] == "plan"
+    assert result["data"]["total"] == 21
+    config = plugin._updated_configs[-1]
+    assert config["slot_strategy"] == "plan"
+    assert config["slot_plan"] == "1,2,3,4,5,6"
+
+    result = asyncio.run(plugin.api_slot_mode({"mode": "auto"}))
+    assert result["success"] is True
+    assert plugin._slot_strategy == "auto"
+    assert plugin._updated_configs[-1]["slot_strategy"] == "auto"
+
+
+def test_slot_mode_plan_initializes_empty_plan(monkeypatch):
+    """切到 plan 且计划为空时自动初始化 6 段，绝不出现 0 竿静默停钓。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "auto"
+    plugin._slot_plan = []
+    plugin._slot_plan_text = ""
+    plugin._state.update({"attempts_used": 5, "attempts_limit": 50})
+
+    result = asyncio.run(plugin.api_slot_mode({"mode": "plan"}))
+    assert result["success"] is True, result
+    assert plugin._slot_strategy == "plan"
+    assert len(plugin._slot_plan) == 6
+    assert sum(plugin._slot_plan) > 0
+    assert result["data"]["total"] == sum(plugin._slot_plan)
+    assert plugin._updated_configs[-1]["slot_plan"] == ",".join(
+        str(v) for v in plugin._slot_plan
+    )
+
+
+def test_init_slot_plan_values_formula(monkeypatch):
+    """初始化公式：剩余次数按剩余时段均匀分配，per<=0 回退有效日限/6，且 per 夹取 99。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    monkeypatch.setattr(
+        module.SiQiFishingV3,
+        "_SiQiFishingV3__time_slot",
+        staticmethod(lambda hour=0: 3),
+    )
+    plugin._state.update({"attempts_used": 0, "attempts_limit": 0})
+    plugin._daily["casts"] = 3
+    plugin._daily_cast_limit = 40
+    # 剩余 37 次 ÷ 剩余 4 段 = ceil(9.25)=10
+    assert plugin._SiQiFishingV3__init_slot_plan_values() == [10] * 6
+
+    # 剩余为 0 时回退到有效日限/6：40 ÷ 6 = ceil(6.67)=7
+    plugin._daily["casts"] = 40
+    assert plugin._SiQiFishingV3__init_slot_plan_values() == [7] * 6
+
+    # 站点剩余很大时 per 被夹取到 99
+    monkeypatch.setattr(
+        module.SiQiFishingV3,
+        "_SiQiFishingV3__time_slot",
+        staticmethod(lambda hour=0: 6),
+    )
+    plugin._state.update({"attempts_used": 0, "attempts_limit": 600})
+    plugin._daily["casts"] = 0
+    assert plugin._SiQiFishingV3__init_slot_plan_values() == [99] * 6
+
+
+def test_slot_mode_plan_reinit(monkeypatch):
+    """reinit=True 时即使已有计划也按当前剩余重新初始化；不加 reinit 保留原计划。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = [0, 0, 0, 0, 0, 0]
+    plugin._slot_plan_text = "0,0,0,0,0,0"
+    monkeypatch.setattr(
+        module.SiQiFishingV3,
+        "_SiQiFishingV3__time_slot",
+        staticmethod(lambda hour=0: 3),
+    )
+    plugin._state.update({"attempts_used": 0, "attempts_limit": 0})
+    plugin._daily["casts"] = 4
+    plugin._daily_cast_limit = 40
+    # 剩余 36 ÷ 剩余 4 段 = 9
+    result = asyncio.run(plugin.api_slot_mode({"mode": "plan", "reinit": True}))
+    assert result["success"] is True
+    assert plugin._slot_plan == [9] * 6
+
+    plugin._slot_plan = [1, 1, 1, 1, 1, 1]
+    plugin._slot_plan_text = "1,1,1,1,1,1"
+    asyncio.run(plugin.api_slot_mode({"mode": "plan"}))
+    assert plugin._slot_plan == [1, 1, 1, 1, 1, 1]
+
+
+def test_slot_mode_rejects_invalid_mode():
+    """非法 mode 一律拒绝、返回三键外壳且不写配置。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+
+    for bad in ("turbo", "", None, 123):
+        result = asyncio.run(plugin.api_slot_mode({"mode": bad}))
+        assert result["success"] is False, bad
+        assert set(result) == {"success", "message", "data"}
+    result = asyncio.run(plugin.api_slot_mode({}))
+    assert result["success"] is False
+    assert plugin._updated_configs == []
+
+
+def test_adjust_slot_clamps_to_bounds():
+    """delta 超出上界夹取到 upper=min(99, 有效日限)，下界夹取到 0。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = [5, 5, 5, 5, 5, 5]
+    plugin._slot_plan_text = "5,5,5,5,5,5"
+    plugin._state.update({"attempts_limit": 20})
+    plugin._daily_cast_limit = 40
+
+    result = asyncio.run(plugin.api_adjust_slot({"slot": 1, "delta": 99}))
+    assert result["success"] is True, result
+    assert plugin._slot_plan[0] == 20
+    result = asyncio.run(plugin.api_adjust_slot({"slot": 2, "delta": -99}))
+    assert plugin._slot_plan[1] == 0
+    result = asyncio.run(plugin.api_adjust_slot({"slot": 3, "value": 99}))
+    assert plugin._slot_plan[2] == 20
+    assert result["data"]["value"] == 20
+
+
+def test_adjust_slot_absolute_value():
+    """使用 value 直接设置绝对值并回写配置。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = [0, 0, 0, 0, 0, 0]
+    plugin._slot_plan_text = "0,0,0,0,0,0"
+    plugin._state.update({"attempts_limit": 0})
+    plugin._daily_cast_limit = 40
+
+    result = asyncio.run(plugin.api_adjust_slot({"slot": 4, "value": 7}))
+    assert result["success"] is True, result
+    assert plugin._slot_plan[3] == 7
+    assert result["data"]["value"] == 7
+    config = plugin._updated_configs[-1]
+    assert config["slot_plan"] == "0,0,0,7,0,0"
+    assert config["slot_strategy"] == "plan"
+
+
+def test_adjust_slot_initializes_empty_plan(monkeypatch):
+    """plan 模式空计划时先初始化，再叠加本次调整。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = []
+    plugin._slot_plan_text = ""
+    monkeypatch.setattr(
+        module.SiQiFishingV3,
+        "_SiQiFishingV3__time_slot",
+        staticmethod(lambda hour=0: 3),
+    )
+    plugin._state.update({"attempts_used": 0, "attempts_limit": 0})
+    plugin._daily["casts"] = 0
+    plugin._daily_cast_limit = 40
+
+    result = asyncio.run(plugin.api_adjust_slot({"slot": 2, "delta": 1}))
+    assert result["success"] is True, result
+    assert plugin._slot_plan == [10, 11, 10, 10, 10, 10]
+
+
+def test_adjust_slot_rejects_invalid_input():
+    """slot/delta/value 非法或缺失、非 plan 模式一律拒绝并返回三键外壳。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = [1, 1, 1, 1, 1, 1]
+    plugin._slot_plan_text = "1,1,1,1,1,1"
+
+    for payload in (
+        {"slot": 0, "delta": 1},
+        {"slot": 7, "delta": 1},
+        {"slot": "x", "delta": 1},
+        {"slot": 1, "delta": 100},
+        {"slot": 1, "delta": -100},
+        {"slot": 1, "value": 100},
+        {"slot": 1, "value": -1},
+        {"slot": 1},
+    ):
+        result = asyncio.run(plugin.api_adjust_slot(payload))
+        assert result["success"] is False, payload
+        assert set(result) == {"success", "message", "data"}
+
+    plugin._slot_strategy = "auto"
+    result = asyncio.run(plugin.api_adjust_slot({"slot": 1, "delta": 1}))
+    assert result["success"] is False
+    assert "手动分配" in str(result["message"])
+
+
+def test_adjust_slot_zero_total_warns():
+    """计划总数归零时提示「今日将不抛竿」。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = [0, 0, 0, 0, 0, 0]
+    plugin._slot_plan_text = "0,0,0,0,0,0"
+    plugin._state.update({"attempts_limit": 0})
+
+    result = asyncio.run(plugin.api_adjust_slot({"slot": 1, "delta": 0}))
+    assert result["success"] is True
+    assert result["data"]["total"] == 0
+    assert "计划总数为 0" in str(result["message"])
+
+
+def test_slot_grid_plan_has_adjust_buttons():
+    """plan 模式每格 4 个 x-small 调整按钮，auto 模式无按钮。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    grid_fn = getattr(plugin, "_SiQiFishingV3__slot_grid")
+
+    plan_grid = grid_fn({}, 3, "plan", 8, 5, [1, 2, 3, 4, 5, 6])
+    assert len(plan_grid) == 6
+    for cell in plan_grid:
+        buttons = [
+            node
+            for node in _iter_nodes(cell)
+            if isinstance(node, dict) and node.get("component") == "VBtn"
+        ]
+        assert len(buttons) == 4, cell
+        for button in buttons:
+            assert _btn_props(button).get("size") == "x-small"
+            assert _btn_api(button).endswith("/adjust_slot")
+    assert "时段1" in _node_text(plan_grid[0])
+    assert "1 竿" in _node_text(plan_grid[0])
+
+    auto_grid = grid_fn({}, 3, "auto", 8, 5)
+    for cell in auto_grid:
+        assert not [
+            node
+            for node in _iter_nodes(cell)
+            if isinstance(node, dict) and node.get("component") == "VBtn"
+        ]
+
+
+def test_page_slot_mode_buttons_and_hints():
+    """详情页含自动/手动/按剩余平均按钮，并按超限或零计划显示彩色提示。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = [10, 10, 10, 10, 10, 10]
+    plugin._slot_plan_text = "10,10,10,10,10,10"
+    plugin._daily_cast_limit = 20
+
+    page = plugin.get_page()
+    mode_buttons = [
+        node for node in _vbtn_nodes(page) if _btn_api(node).endswith("/slot_mode")
+    ]
+    labels = [node.get("text") for node in mode_buttons]
+    assert "自动分配" in labels
+    assert "手动分配" in labels
+    assert "按剩余平均" in labels
+
+    manual = [node for node in mode_buttons if node.get("text") == "手动分配"][0]
+    assert _btn_props(manual).get("variant") == "flat"
+    assert _btn_props(manual).get("color") == "primary"
+
+    page_text = json.dumps(page, ensure_ascii=False)
+    assert "计划合计 60 竿 > 每日上限 20" in page_text
+    assert "#ef4444" in page_text
+
+    plugin._slot_plan = [0, 0, 0, 0, 0, 0]
+    zero_text = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "计划总数为 0，今日将不抛竿" in zero_text
+    assert "#f59e0b" in zero_text
+
+
+def test_get_api_slot_endpoints():
+    """/slot_mode 与 /adjust_slot 以 POST + bear 暴露，且带摘要说明。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    apis = {api["path"]: api for api in plugin.get_api()}
+
+    for path in ("/slot_mode", "/adjust_slot"):
+        assert path in apis, sorted(apis)
+        assert apis[path]["methods"] == ["POST"], path
+        assert apis[path]["auth"] == "bear", path
+        assert callable(apis[path]["endpoint"]), path
+        assert apis[path]["summary"], path
+        assert apis[path]["description"], path
+
+
+def test_version_135_history_message():
+    """package.v3.json 顶部新增 v1.3.5 历史说明。"""
+    module = load_plugin_module()
+    cls = module.SiQiFishingV3
+    package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
+    entry = package[cls.__name__]
+    assert "v1.3.5" in entry["history"]
+    assert entry["history"]["v1.3.5"].startswith("详情页时段格子内可直接设置")
+
+
+def test_form_slot_plan_hint_manual_only(monkeypatch):
+    """配置页 slot_plan 提示改为「仅『手动分配』模式下生效」。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    plugin = build_plugin(module)
+    form_text = json.dumps(plugin.get_form()[0], ensure_ascii=False)
+    assert "仅『手动分配』模式下生效" in form_text
 
 
 _MISSING = object()

@@ -27,7 +27,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.4"
+    plugin_version = "1.3.5"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -189,6 +189,7 @@ class SiQiFishingV3(_PluginBase):
     ONCE_JOB_IDS = ("run_once", "api_run_once", "command_run_once")
 
     _lock: Optional[asyncio.Lock] = None
+    _slot_lock: Optional[asyncio.Lock] = None
     _daily: Dict[str, Any] = {
         "date": "",
         "casts": 0,
@@ -289,14 +290,7 @@ class SiQiFishingV3(_PluginBase):
             slot_strategy = "manual" if legacy_spread else "off"
         self._slot_plan_text = str(config.get("slot_plan") or "").strip()
         self._slot_plan = self.__parse_slot_plan(self._slot_plan_text)
-        if self._slot_plan:
-            if slot_strategy != "plan":
-                logger.info(
-                    "思齐钓鱼：已填写分时段计划，时段策略强制改为 plan（原策略 %s）",
-                    slot_strategy,
-                )
-            self._slot_strategy = "plan"
-        elif slot_strategy == "plan":
+        if slot_strategy == "plan" and not self._slot_plan:
             logger.warning("思齐钓鱼：时段策略为 plan 但分时段计划为空，已回退为 auto")
             self._slot_strategy = "auto"
         else:
@@ -412,6 +406,22 @@ class SiQiFishingV3(_PluginBase):
                 "auth": "bear",
                 "summary": "交付可完成任务",
                 "description": "刷新状态后仅交付 progress.ready 的任务",
+            },
+            {
+                "path": "/slot_mode",
+                "endpoint": self.api_slot_mode,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "切换时段分配模式",
+                "description": "自动分配/手动分配切换并持久化；手动模式空计划时按剩余次数自动初始化",
+            },
+            {
+                "path": "/adjust_slot",
+                "endpoint": self.api_adjust_slot,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "调整单个时段计划次数",
+                "description": "仅手动分配模式可用，按 delta 或目标值调整某时段并持久化",
             },
         ]
 
@@ -904,7 +914,7 @@ class SiQiFishingV3(_PluginBase):
                                     "props": {
                                         "model": "slot_plan",
                                         "label": "分时段次数（1~6时段）",
-                                        "hint": "6 个整数逗号分隔，0=不钓；例 0,0,8,0,10,0；填写后自动按计划执行",
+                                        "hint": "6 个整数逗号分隔，0=不钓；仅『手动分配』模式下生效",
                                     },
                                 },
                             ),
@@ -1203,6 +1213,7 @@ class SiQiFishingV3(_PluginBase):
         disabled: bool = False,
         color: Optional[str] = None,
         variant: Optional[str] = None,
+        size: str = "small",
     ) -> Dict[str, Any]:
         """构造四态 VBtn 并绑定插件 API。
 
@@ -1221,7 +1232,7 @@ class SiQiFishingV3(_PluginBase):
         return {
             "component": "VBtn",
             "props": {
-                "size": "small",
+                "size": size,
                 "variant": variant,
                 "color": color,
                 "disabled": bool(disabled),
@@ -1832,6 +1843,10 @@ class SiQiFishingV3(_PluginBase):
         )
         quota = self.__slot_quota(slot_remaining, slot_left)
         plan_values = list(self._slot_plan or [])
+        plan_display = [
+            (plan_values[i] if i < len(plan_values) else 0) for i in range(6)
+        ]
+        plan_total = sum(max(0, self.__safe_int(v, 0)) for v in plan_display)
         if slot_strategy == "plan":
             quota = plan_values[slot_no - 1] if 1 <= slot_no <= len(plan_values) else 0
         slots = daily.get("slots") if isinstance(daily.get("slots"), dict) else {}
@@ -1843,14 +1858,75 @@ class SiQiFishingV3(_PluginBase):
         elif slot_strategy == "manual":
             slot_summary = f"手动：每时段 {self._per_slot_casts} 次（配置页修改）"
         elif slot_strategy == "plan":
-            display = [plan_values[i] if i < len(plan_values) else 0 for i in range(6)]
-            total = sum(display)
             slot_summary = (
-                f"自定义计划：时段1-6 = {'/'.join(str(v) for v in display)}"
-                f"（共 {total} 竿）"
+                f"自定义计划：时段1-6 = {'/'.join(str(v) for v in plan_display)}"
+                f"（共 {plan_total} 竿）"
             )
         else:
             slot_summary = "不限时段"
+
+        mode_buttons = [
+            {
+                "component": "span",
+                "props": {
+                    "style": "font-size:12px; color:#334155; margin-right:2px;"
+                },
+                "text": "时段分配：",
+            },
+            self.__btn(
+                "自动分配",
+                "slot_mode",
+                {"mode": "auto"},
+                selected=slot_strategy == "auto",
+            ),
+            self.__btn(
+                "手动分配",
+                "slot_mode",
+                {"mode": "plan"},
+                selected=slot_strategy == "plan",
+            ),
+        ]
+        if slot_strategy == "plan":
+            mode_buttons.append(
+                self.__btn(
+                    "按剩余平均",
+                    "slot_mode",
+                    {"mode": "plan", "reinit": True},
+                    variant="tonal",
+                    color="primary",
+                )
+            )
+        mode_row = {
+            "component": "div",
+            "props": {
+                "style": (
+                    "display:flex; align-items:center; gap:6px;"
+                    " flex-wrap:wrap; margin-top:10px;"
+                )
+            },
+            "content": mode_buttons,
+        }
+
+        slot_hint: Optional[Dict[str, Any]] = None
+        if slot_strategy == "plan":
+            if plan_total > limit:
+                slot_hint = {
+                    "component": "div",
+                    "props": {
+                        "style": "font-size:12px; color:#ef4444; margin-top:6px;"
+                    },
+                    "text": (
+                        f"⚠ 计划合计 {plan_total} 竿 > 每日上限 {limit}，超出会被截断"
+                    ),
+                }
+            elif plan_total == 0:
+                slot_hint = {
+                    "component": "div",
+                    "props": {
+                        "style": "font-size:12px; color:#f59e0b; margin-top:6px;"
+                    },
+                    "text": "⚠ 计划总数为 0，今日将不抛竿",
+                }
 
         lure_total = sum(
             max(0, self.__safe_int(v, 0))
@@ -1939,16 +2015,27 @@ class SiQiFishingV3(_PluginBase):
                                 f"购饵花费 {max(0, self.__safe_int(daily.get('spent'), 0))}"
                             ),
                         },
+                        mode_row,
                         {
                             "component": "div",
                             "props": {
                                 "style": (
-                                    "display:grid; grid-template-columns:repeat(auto-fit,minmax(72px,1fr));"
-                                    " gap:6px; margin-top:10px;"
+                                    "display:grid; grid-template-columns:"
+                                    + (
+                                        "repeat(auto-fit,minmax(110px,1fr));"
+                                        if slot_strategy == "plan"
+                                        else "repeat(auto-fit,minmax(72px,1fr));"
+                                    )
+                                    + " gap:6px; margin-top:10px;"
                                 )
                             },
                             "content": self.__slot_grid(
-                                slots, slot_no, slot_strategy, self._per_slot_casts, quota
+                                slots,
+                                slot_no,
+                                slot_strategy,
+                                self._per_slot_casts,
+                                quota,
+                                plan_values,
                             ),
                         },
                         {
@@ -1956,6 +2043,7 @@ class SiQiFishingV3(_PluginBase):
                             "props": {"style": "font-size:12px; color:#6b7280; margin-top:8px;"},
                             "text": slot_summary,
                         },
+                        *([slot_hint] if slot_hint else []),
                     ],
                 },
             ],
@@ -2344,7 +2432,7 @@ class SiQiFishingV3(_PluginBase):
                 logger.warning("思齐钓鱼：未填写分时段计划，拒绝切换到 plan")
                 return self.__api_response(
                     False,
-                    "未填写分时段计划，请先在配置页填写 slot_plan（6 个整数，逗号分隔）后再选择自定义",
+                    "未填写分时段计划，请先在配置页填写 slot_plan（6 个整数，逗号分隔）后再选择自定义，或直接在详情页点『手动分配』自动生成",
                     {"key": key},
                 )
 
@@ -2371,6 +2459,143 @@ class SiQiFishingV3(_PluginBase):
         logger.info(f"思齐钓鱼：页面已更新{label}")
         return self.__api_response(
             True, f"已更新{label}", {"key": key, "value": normalized}
+        )
+
+    async def api_slot_mode(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """API：切换自动/手动时段分配，plan 空计划或 reinit 时自动初始化并持久化。"""
+        payload = payload if isinstance(payload, dict) else {}
+        mode = str(payload.get("mode") or "").strip().lower()
+        if mode not in ("auto", "plan"):
+            return self.__api_response(
+                False, "模式仅支持 auto / plan", {"mode": mode}
+            )
+        reinit = bool(payload.get("reinit"))
+
+        async with self.__get_slot_lock():
+            plan = list(self._slot_plan or [])
+            if mode == "plan" and (not plan or reinit):
+                plan = self.__init_slot_plan_values()
+            plan_text = ",".join(str(v) for v in plan) if plan else ""
+            try:
+                config = dict(self.get_config() or {})
+            except Exception as e:
+                logger.error(f"思齐钓鱼：读取配置失败，未保存模式切换：{e}")
+                return self.__api_response(
+                    False, "读取配置失败，未保存", {"mode": mode}
+                )
+            config["slot_strategy"] = mode
+            config["slot_plan"] = plan_text
+            try:
+                self.update_config(config)
+            except Exception as e:
+                logger.error(f"思齐钓鱼：保存时段模式失败：{e}")
+                return self.__api_response(
+                    False, f"保存失败：{e}", {"mode": mode}
+                )
+            self._slot_strategy = mode
+            self._slot_plan = list(plan)
+            self._slot_plan_text = plan_text
+
+        total = sum(plan)
+        if mode == "auto":
+            message = "已切换为自动分配"
+        else:
+            message = f"已切换为手动分配，计划共 {total} 竿"
+        logger.info(f"思齐钓鱼：时段分配模式已切换为 {mode}（共 {total} 竿）")
+        return self.__api_response(
+            True, message, {"mode": mode, "slot_plan": list(plan), "total": total}
+        )
+
+    async def api_adjust_slot(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """API：仅手动分配模式下调整单个时段的计划次数，夹取后持久化。"""
+        payload = payload if isinstance(payload, dict) else {}
+        try:
+            slot = int(payload.get("slot"))
+        except (TypeError, ValueError):
+            return self.__api_response(
+                False, "时段必须是 1~6 的整数", {"slot": payload.get("slot")}
+            )
+        if slot < 1 or slot > 6:
+            return self.__api_response(False, "时段必须是 1~6 的整数", {"slot": slot})
+
+        has_delta = payload.get("delta") is not None
+        has_value = payload.get("value") is not None
+        delta: Optional[int] = None
+        target: Optional[int] = None
+        if has_delta:
+            try:
+                delta = int(payload.get("delta"))
+            except (TypeError, ValueError):
+                return self.__api_response(
+                    False, "调整量必须是 -99~99 的整数", {"slot": slot}
+                )
+            if delta < -99 or delta > 99:
+                return self.__api_response(
+                    False, "调整量必须是 -99~99 的整数", {"slot": slot}
+                )
+        if has_value:
+            try:
+                target = int(payload.get("value"))
+            except (TypeError, ValueError):
+                return self.__api_response(
+                    False, "目标值必须是 0~99 的整数", {"slot": slot}
+                )
+            if target < 0 or target > 99:
+                return self.__api_response(
+                    False, "目标值必须是 0~99 的整数", {"slot": slot}
+                )
+        if not has_delta and not has_value:
+            return self.__api_response(False, "需要提供 delta 或 value", {"slot": slot})
+
+        async with self.__get_slot_lock():
+            if self._slot_strategy != "plan":
+                return self.__api_response(
+                    False,
+                    "请先点击『手动分配』后再调整各时段次数",
+                    {"slot": slot},
+                )
+            plan = list(self._slot_plan or [])
+            if not plan:
+                plan = self.__init_slot_plan_values()
+            if len(plan) < 6:
+                plan = plan + [0] * (6 - len(plan))
+            current = self.__safe_int(plan[slot - 1], 0)
+            state = self._state or {}
+            site_limit = self.__safe_int(state.get("attempts_limit"), 0)
+            upper = min(
+                99, self.__effective_limit(self._daily_cast_limit, site_limit) or 99
+            )
+            new_value = target if has_value else current + (delta or 0)
+            new_value = min(upper, max(0, new_value))
+            plan[slot - 1] = new_value
+            plan_text = ",".join(str(v) for v in plan)
+            try:
+                config = dict(self.get_config() or {})
+            except Exception as e:
+                logger.error(f"思齐钓鱼：读取配置失败，未保存时段调整：{e}")
+                return self.__api_response(
+                    False, "读取配置失败，未保存", {"slot": slot}
+                )
+            config["slot_strategy"] = "plan"
+            config["slot_plan"] = plan_text
+            try:
+                self.update_config(config)
+            except Exception as e:
+                logger.error(f"思齐钓鱼：保存时段调整失败：{e}")
+                return self.__api_response(False, f"保存失败：{e}", {"slot": slot})
+            self._slot_strategy = "plan"
+            self._slot_plan = list(plan)
+            self._slot_plan_text = plan_text
+
+        total = sum(plan)
+        message = f"时段{slot}已调整为 {new_value} 竿（共 {total} 竿）"
+        if total == 0:
+            message += "；计划总数为 0，今日将不抛竿"
+        logger.info(f"思齐钓鱼：时段{slot}计划已调整为 {new_value} 竿")
+        return self.__api_response(
+            True,
+            message,
+            {"slot": slot, "value": new_value, "slot_plan": list(plan), "total": total},
         )
 
     async def api_deliver(self) -> Dict[str, Any]:
@@ -3419,6 +3644,28 @@ class SiQiFishingV3(_PluginBase):
             ),
         )
 
+    def __init_slot_plan_values(self) -> List[int]:
+        """按当前剩余次数与剩余时段计算一份均匀的 6 段计划，用于手动模式初始化。"""
+        now = datetime.now(self.TZ_CN)
+        slot_no = self.__time_slot(now.hour)
+        state = self._state or {}
+        daily = self._daily or {}
+        site_used = max(0, self.__safe_int(state.get("attempts_used"), 0))
+        site_limit = max(0, self.__safe_int(state.get("attempts_limit"), 0))
+        daily_casts = max(0, self.__safe_int(daily.get("casts"), 0))
+        remaining = self.__remaining_casts(
+            site_used, site_limit, daily_casts, self._daily_cast_limit
+        )
+        per = self.__slot_quota(remaining, self.__slots_left(slot_no))
+        if per <= 0:
+            per = (
+                self.__slot_quota(
+                    self.__effective_limit(self._daily_cast_limit, site_limit), 6
+                )
+                or 1
+            )
+        return [min(per, 99)] * 6
+
     def __slot_exhausted_reason(
         self,
         site_used: int,
@@ -3449,32 +3696,107 @@ class SiQiFishingV3(_PluginBase):
             return f"本时段计划已用完（{slot_used}/{planned}），下一时段按计划恢复"
         return f"本时段配额已用完（已用 {slot_used} 竿），下一时段自动恢复"
 
-    @staticmethod
     def __slot_grid(
+        self,
         slots: Dict[str, Any],
         current_slot: int,
         strategy: str,
         per_slot: int,
         quota: int,
+        plan_values: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
-        """返回 6 个时段格子的 div 节点：过去为实际竿数，当前为 used/cap，未来为占位。"""
+        """返回 6 个时段格子的 div 节点；plan 模式额外显示计划值与四个加减按钮。"""
         slots = slots if isinstance(slots, dict) else {}
-        current = min(6, max(1, SiQiFishingV3.__safe_int(current_slot, 1)))
-        if strategy == "auto":
-            cap_text = str(max(0, SiQiFishingV3.__safe_int(quota, 0)))
-        elif strategy == "manual":
-            cap_text = str(max(0, SiQiFishingV3.__safe_int(per_slot, 0)))
-        elif strategy == "plan":
-            cap_text = str(max(0, SiQiFishingV3.__safe_int(quota, 0)))
-        else:
-            cap_text = "–"
+        current = min(6, max(1, self.__safe_int(current_slot, 1)))
         base = (
             "border-radius:8px; padding:6px 2px; text-align:center;"
             " font-size:11px; line-height:1.5;"
         )
+        if strategy == "auto":
+            cap_text = str(max(0, self.__safe_int(quota, 0)))
+        elif strategy == "manual":
+            cap_text = str(max(0, self.__safe_int(per_slot, 0)))
+        elif strategy == "plan":
+            cap_text = str(max(0, self.__safe_int(quota, 0)))
+        else:
+            cap_text = "–"
+
+        plan_display = [0] * 6
+        if strategy == "plan":
+            values = list(plan_values or [])
+            plan_display = [
+                max(0, self.__safe_int(values[i], 0)) if i < len(values) else 0
+                for i in range(6)
+            ]
+
         cells: List[Dict[str, Any]] = []
         for index in range(1, 7):
-            used = max(0, SiQiFishingV3.__safe_int(slots.get(str(index)), 0))
+            used = max(0, self.__safe_int(slots.get(str(index)), 0))
+            highlighted = index == current
+            if strategy == "plan":
+                style = (
+                    base
+                    + (
+                        "background:rgba(37,99,235,0.12); border:1px solid #2563eb;"
+                        " color:#1d4ed8; font-weight:700;"
+                        if highlighted
+                        else "background:rgba(148,163,184,0.10);"
+                        " border:1px solid rgba(148,163,184,0.35); color:#334155;"
+                    )
+                )
+                planned = plan_display[index - 1]
+                cells.append(
+                    {
+                        "component": "div",
+                        "props": {"style": style},
+                        "content": [
+                            {
+                                "component": "div",
+                                "text": (
+                                    f"▶ 时段{index}" if highlighted else f"时段{index}"
+                                ),
+                            },
+                            {"component": "div", "text": f"{planned} 竿"},
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": (
+                                        "display:flex; flex-wrap:wrap; gap:2px;"
+                                        " justify-content:center; margin-top:4px;"
+                                    )
+                                },
+                                "content": [
+                                    self.__btn(
+                                        "−5",
+                                        "adjust_slot",
+                                        {"slot": index, "delta": -5},
+                                        size="x-small",
+                                    ),
+                                    self.__btn(
+                                        "−1",
+                                        "adjust_slot",
+                                        {"slot": index, "delta": -1},
+                                        size="x-small",
+                                    ),
+                                    self.__btn(
+                                        "+1",
+                                        "adjust_slot",
+                                        {"slot": index, "delta": 1},
+                                        size="x-small",
+                                    ),
+                                    self.__btn(
+                                        "+5",
+                                        "adjust_slot",
+                                        {"slot": index, "delta": 5},
+                                        size="x-small",
+                                    ),
+                                ],
+                            },
+                        ],
+                    }
+                )
+                continue
+
             if index < current:
                 cells.append(
                     {
@@ -3576,6 +3898,12 @@ class SiQiFishingV3(_PluginBase):
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
+
+    def __get_slot_lock(self) -> asyncio.Lock:
+        """时段计划读改写专用锁，避免与任务运行锁互相阻塞或复用。"""
+        if self._slot_lock is None:
+            self._slot_lock = asyncio.Lock()
+        return self._slot_lock
 
     def __build_client(
         self, cookie: str, headers: Dict[str, str], timeout: int
