@@ -3,6 +3,7 @@
 import asyncio
 import json
 import random
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,7 +27,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.3"
+    plugin_version = "1.3.4"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -113,7 +114,7 @@ class SiQiFishingV3(_PluginBase):
         "slot_strategy": {
             "type": "enum",
             "label": "时段分配",
-            "values": ("auto", "manual", "off"),
+            "values": ("auto", "manual", "off", "plan"),
         },
         "buy_budget_per_day": {
             "type": "int",
@@ -143,6 +144,7 @@ class SiQiFishingV3(_PluginBase):
         "slider_jitter",
         "guess_value",
         "per_slot_casts",
+        "slot_plan",
         "max_casts_per_run",
         "cast_interval",
         "buy_lure_key",
@@ -181,6 +183,8 @@ class SiQiFishingV3(_PluginBase):
 
     _slot_strategy = "off"
     _per_slot_casts = 8
+    _slot_plan: List[int] = []
+    _slot_plan_text = ""
 
     ONCE_JOB_IDS = ("run_once", "api_run_once", "command_run_once")
 
@@ -277,13 +281,26 @@ class SiQiFishingV3(_PluginBase):
         self._guess_value = max(0, self.__safe_int(config.get("guess_value"), 0))
 
         slot_strategy = str(config.get("slot_strategy") or "").strip().lower()
-        if slot_strategy not in ("auto", "manual", "off"):
+        if slot_strategy not in ("auto", "manual", "off", "plan"):
             # 旧配置只有 slot_spread 布尔值：开启视为手动，关闭或缺失视为不分时段
             legacy_spread = config.get("slot_spread", False)
             if isinstance(legacy_spread, str):
                 legacy_spread = legacy_spread.strip().lower() in ("true", "1", "yes", "on")
             slot_strategy = "manual" if legacy_spread else "off"
-        self._slot_strategy = slot_strategy
+        self._slot_plan_text = str(config.get("slot_plan") or "").strip()
+        self._slot_plan = self.__parse_slot_plan(self._slot_plan_text)
+        if self._slot_plan:
+            if slot_strategy != "plan":
+                logger.info(
+                    "思齐钓鱼：已填写分时段计划，时段策略强制改为 plan（原策略 %s）",
+                    slot_strategy,
+                )
+            self._slot_strategy = "plan"
+        elif slot_strategy == "plan":
+            logger.warning("思齐钓鱼：时段策略为 plan 但分时段计划为空，已回退为 auto")
+            self._slot_strategy = "auto"
+        else:
+            self._slot_strategy = slot_strategy
         self._per_slot_casts = max(
             1, self.__safe_int(config.get("per_slot_casts"), 8, min_value=1)
         )
@@ -853,6 +870,7 @@ class SiQiFishingV3(_PluginBase):
                                                 "value": "auto",
                                             },
                                             {"title": "手动（每时段固定）", "value": "manual"},
+                                            {"title": "自定义（按分时段计划）", "value": "plan"},
                                             {"title": "关闭（不限时段）", "value": "off"},
                                         ],
                                         "hint": "GMT+8 每 4 小时一段，每日 6 段",
@@ -875,6 +893,18 @@ class SiQiFishingV3(_PluginBase):
                                         "type": "number",
                                         "min": 1,
                                         "hint": "手动模式下生效，GMT+8 每 4 小时一段",
+                                    },
+                                },
+                            ),
+                            self.__form_col(
+                                12,
+                                3,
+                                {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "slot_plan",
+                                        "label": "分时段次数（1~6时段）",
+                                        "hint": "6 个整数逗号分隔，0=不钓；例 0,0,8,0,10,0；填写后自动按计划执行",
                                     },
                                 },
                             ),
@@ -910,6 +940,7 @@ class SiQiFishingV3(_PluginBase):
             "guess_value": self._guess_value,
             "slot_strategy": self._slot_strategy,
             "per_slot_casts": self._per_slot_casts,
+            "slot_plan": self._slot_plan_text,
             "run_once": False,
         }
 
@@ -968,6 +999,12 @@ class SiQiFishingV3(_PluginBase):
         slot_info = {
             "auto": "自动平均分配",
             "manual": f"每时段最多 {self._per_slot_casts} 次",
+            "plan": (
+                f"自定义计划 {'/'.join(str(v) for v in self._slot_plan)}"
+                f"（共 {sum(self._slot_plan)} 竿）"
+                if self._slot_plan
+                else "自定义计划（未填写）"
+            ),
         }.get(self._slot_strategy, "不限制时段")
 
         strategy_card = {
@@ -1422,15 +1459,20 @@ class SiQiFishingV3(_PluginBase):
         slot_text = {
             "auto": "自动平均",
             "manual": f"手动 {self._per_slot_casts} 次",
+            "plan": (
+                f"自定义 {'/'.join(str(v) for v in self._slot_plan)}"
+                if self._slot_plan
+                else "自定义（未填写）"
+            ),
         }.get(self._slot_strategy, "关闭")
         slot_buttons = [
             self.__btn(
-                {"auto": "自动", "manual": "手动", "off": "关闭"}[mode],
+                {"auto": "自动", "manual": "手动", "off": "关闭", "plan": "自定义"}[mode],
                 "set_option",
                 {"key": "slot_strategy", "value": mode},
                 selected=self._slot_strategy == mode,
             )
-            for mode in ("auto", "manual", "off")
+            for mode in ("auto", "manual", "off", "plan")
         ]
 
         selected_lure = state.get("selected_lure") or ""
@@ -1789,6 +1831,9 @@ class SiQiFishingV3(_PluginBase):
             site_used, site_limit, daily_casts, self._daily_cast_limit
         )
         quota = self.__slot_quota(slot_remaining, slot_left)
+        plan_values = list(self._slot_plan or [])
+        if slot_strategy == "plan":
+            quota = plan_values[slot_no - 1] if 1 <= slot_no <= len(plan_values) else 0
         slots = daily.get("slots") if isinstance(daily.get("slots"), dict) else {}
         if slot_strategy == "auto":
             slot_summary = (
@@ -1797,6 +1842,13 @@ class SiQiFishingV3(_PluginBase):
             )
         elif slot_strategy == "manual":
             slot_summary = f"手动：每时段 {self._per_slot_casts} 次（配置页修改）"
+        elif slot_strategy == "plan":
+            display = [plan_values[i] if i < len(plan_values) else 0 for i in range(6)]
+            total = sum(display)
+            slot_summary = (
+                f"自定义计划：时段1-6 = {'/'.join(str(v) for v in display)}"
+                f"（共 {total} 竿）"
+            )
         else:
             slot_summary = "不限时段"
 
@@ -2284,6 +2336,18 @@ class SiQiFishingV3(_PluginBase):
             logger.warning(f"思齐钓鱼：页面修改选项被拒绝：{label}")
             return self.__api_response(False, label, {"key": key})
 
+        if key == "slot_strategy":
+            target_strategy = (
+                normalized if isinstance(normalized, str) else str(value or "")
+            ).strip().lower()
+            if target_strategy == "plan" and not self._slot_plan:
+                logger.warning("思齐钓鱼：未填写分时段计划，拒绝切换到 plan")
+                return self.__api_response(
+                    False,
+                    "未填写分时段计划，请先在配置页填写 slot_plan（6 个整数，逗号分隔）后再选择自定义",
+                    {"key": key},
+                )
+
         if key == "rod_fixed" and not self.__rod_unlocked(normalized["rod_key"]):
             return self.__api_response(False, "鱼竿未解锁", {"key": key})
 
@@ -2454,6 +2518,7 @@ class SiQiFishingV3(_PluginBase):
                 slot_used=slot_used,
                 per_slot=self._per_slot_casts,
                 max_per_run=self._max_casts_per_run,
+                slot_plan=self._slot_plan,
             )
             if allowed_now <= 0:
                 remaining_now = self.__remaining_casts(
@@ -2569,6 +2634,7 @@ class SiQiFishingV3(_PluginBase):
                 slot_used=slot_used,
                 per_slot=self._per_slot_casts,
                 max_per_run=cast_limit - casts,
+                slot_plan=self._slot_plan,
             )
             if allowed <= 0:
                 status = "partial"
@@ -3285,6 +3351,26 @@ class SiQiFishingV3(_PluginBase):
         )
 
     @staticmethod
+    def __parse_slot_plan(raw: Any) -> List[int]:
+        """解析分时段计划：恰好 6 个 0~99 整数，支持中英文逗号/分号/空白分隔；非 6 个或无效返回空列表。"""
+        if raw is None:
+            return []
+        text = str(raw).strip()
+        if not text:
+            return []
+        parts = [part for part in re.split(r"[,，;；\s]+", text) if part != ""]
+        if len(parts) != 6:
+            return []
+        values: List[int] = []
+        for part in parts:
+            try:
+                number = int(part)
+            except (TypeError, ValueError):
+                return []
+            values.append(min(99, max(0, number)))
+        return values
+
+    @staticmethod
     def __plan_slot_casts(
         *,
         strategy: str,
@@ -3296,6 +3382,7 @@ class SiQiFishingV3(_PluginBase):
         slot_used: int,
         per_slot: int,
         max_per_run: int,
+        slot_plan: Optional[List[int]] = None,
     ) -> int:
         """计算本时段本轮还能抛几竿：时段配额先减已用，再与单轮、剩余、日限取最小值。"""
         remaining = SiQiFishingV3.__remaining_casts(
@@ -3311,6 +3398,10 @@ class SiQiFishingV3(_PluginBase):
             )
         elif strategy == "manual":
             cap = SiQiFishingV3.__safe_int(per_slot, 0) - slot_used
+        elif strategy == "plan":
+            plan = slot_plan or []
+            planned = plan[slot - 1] if 1 <= slot <= len(plan) else 0
+            cap = SiQiFishingV3.__safe_int(planned, 0) - slot_used
         else:
             cap = SiQiFishingV3.MAX_DAILY_CASTS
         daily_remaining = max(
@@ -3349,6 +3440,13 @@ class SiQiFishingV3(_PluginBase):
         if self._slot_strategy == "manual":
             cap = max(0, self.__safe_int(self._per_slot_casts, 0))
             return f"本时段配额已用完（{slot_used}/{cap}），下一时段自动恢复"
+        if self._slot_strategy == "plan":
+            plan = self._slot_plan or []
+            planned = plan[slot - 1] if 1 <= slot <= len(plan) else 0
+            planned = self.__safe_int(planned, 0)
+            if planned <= 0:
+                return "本时段计划不钓（0 竿）"
+            return f"本时段计划已用完（{slot_used}/{planned}），下一时段按计划恢复"
         return f"本时段配额已用完（已用 {slot_used} 竿），下一时段自动恢复"
 
     @staticmethod
@@ -3366,6 +3464,8 @@ class SiQiFishingV3(_PluginBase):
             cap_text = str(max(0, SiQiFishingV3.__safe_int(quota, 0)))
         elif strategy == "manual":
             cap_text = str(max(0, SiQiFishingV3.__safe_int(per_slot, 0)))
+        elif strategy == "plan":
+            cap_text = str(max(0, SiQiFishingV3.__safe_int(quota, 0)))
         else:
             cap_text = "–"
         base = (

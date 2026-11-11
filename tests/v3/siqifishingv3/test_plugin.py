@@ -345,7 +345,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.3.3"
+    assert cls.plugin_version == "1.3.4"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -417,7 +417,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.3.3"
+    assert cls.plugin_version == "1.3.4"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -2586,6 +2586,174 @@ def test_slot_strategy_migration(monkeypatch):
     assert build()._slot_strategy == "off"
     assert build(slot_strategy="auto")._slot_strategy == "auto"
     assert build(slot_spread=True, slot_strategy="auto")._slot_strategy == "auto"
+
+
+# ---------------------------------------------------------------------------
+# v1.3.4：分时段自定义抛竿数（slot_plan）
+# ---------------------------------------------------------------------------
+
+
+def test_parse_slot_plan():
+    """分时段计划解析：正常、中文逗号、空格、非 6 段（含多段）、非法值、越界夹取。"""
+    parse = getattr(
+        load_plugin_module().SiQiFishingV3, "_SiQiFishingV3__parse_slot_plan"
+    )
+
+    assert parse("0,0,8,0,10,0") == [0, 0, 8, 0, 10, 0]
+    assert parse("0，0，8，0，10，0") == [0, 0, 8, 0, 10, 0]
+    assert parse("0;0;8;0;10;0") == [0, 0, 8, 0, 10, 0]
+    assert parse(" 1 2 3 4 5 6 ") == [1, 2, 3, 4, 5, 6]
+    assert parse("0,0,8,0,10") == []
+    assert parse("") == []
+    assert parse(None) == []
+    assert parse("a,b,c,d,e,f") == []
+    assert parse("1,2,3,4,5,6,7") == []
+    assert parse("0,0,100,0,10,0") == [0, 0, 99, 0, 10, 0]
+
+
+def test_set_option_rejects_plan_without_plan():
+    """选 plan 但分时段计划为空 → 拒绝，且不改策略、不回写配置。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "off"
+    plugin._slot_plan = []
+    plugin._slot_plan_text = ""
+
+    result = asyncio.run(
+        plugin.api_set_option({"key": "slot_strategy", "value": "plan"})
+    )
+
+    assert result.get("success") is False, result
+    assert "分时段计划" in str(result.get("message") or "")
+    assert plugin._slot_strategy == "off"
+    assert plugin._updated_configs == []
+
+
+def test_set_option_allows_plan_with_plan():
+    """分时段计划非空时允许切换到 plan，并同步内存与配置。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "off"
+    plugin._slot_plan = [0, 0, 1, 0, 1, 0]
+    plugin._slot_plan_text = "0,0,1,0,1,0"
+
+    result = asyncio.run(
+        plugin.api_set_option({"key": "slot_strategy", "value": "plan"})
+    )
+
+    assert result.get("success") is True, result
+    assert plugin._slot_strategy == "plan"
+    assert plugin._updated_configs[-1]["slot_strategy"] == "plan"
+
+
+def test_form_slot_strategy_has_plan_option(monkeypatch):
+    """配置页时段分配下拉必须包含自定义（plan）选项。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    plugin = build_plugin(module)
+
+    def _walk(node):
+        if isinstance(node, dict):
+            yield node
+            for child in node.values():
+                yield from _walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from _walk(child)
+
+    form = plugin.get_form()[0]
+    controls = [
+        item
+        for item in _walk(form)
+        if item.get("component") == "VSelect"
+        and isinstance(item.get("props"), dict)
+        and item["props"].get("model") == "slot_strategy"
+    ]
+    assert controls, "未找到 slot_strategy 的 VSelect 控件"
+    values = [option.get("value") for option in controls[0]["props"].get("items") or []]
+    assert "plan" in values
+
+
+def test_init_slot_plan_forces_plan_strategy(monkeypatch):
+    """有效 slot_plan 强制切换到 plan；plan 为空时回退 auto。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    monkeypatch.setattr(
+        module.scheduler_sdk, "add_plugin_once_job", lambda *a, **k: None
+    )
+
+    plugin = build_plugin(module)
+    plugin.init_plugin(
+        {"enabled": True, "slot_strategy": "auto", "slot_plan": "0,0,8,0,10,0"}
+    )
+    assert plugin._slot_strategy == "plan"
+    assert plugin._slot_plan == [0, 0, 8, 0, 10, 0]
+
+    plugin_empty = build_plugin(module)
+    plugin_empty.init_plugin(
+        {"enabled": True, "slot_strategy": "plan", "slot_plan": ""}
+    )
+    assert plugin_empty._slot_strategy == "auto"
+    assert plugin_empty._slot_plan == []
+
+
+def test_plan_slot_casts_plan_mode():
+    """plan 策略按 slot_plan 对应时段值限额，并受站点/日剩余截断。"""
+    plan_fn = getattr(
+        load_plugin_module().SiQiFishingV3, "_SiQiFishingV3__plan_slot_casts"
+    )
+
+    def call(**kwargs):
+        defaults = dict(
+            strategy="plan",
+            site_used=0,
+            site_limit=0,
+            plugin_casts=0,
+            daily_limit=99,
+            slot=3,
+            slot_used=0,
+            per_slot=8,
+            max_per_run=40,
+            slot_plan=[0, 0, 8, 0, 10, 0],
+        )
+        defaults.update(kwargs)
+        return plan_fn(**defaults)
+
+    assert call(slot=3, slot_used=3) == 5
+    assert call(slot=1, slot_used=0) == 0
+    assert call(slot=6, slot_used=0) == 0
+    assert call(slot=5, slot_used=4) == 6
+    assert call(slot=3, slot_used=3, site_used=97, site_limit=99) == 2
+    assert call(slot=3, slot_used=3, plugin_casts=97, daily_limit=99) == 2
+    # 旧调用方式不传 slot_plan 视为无计划，不抛竿
+    assert (
+        plan_fn(
+            strategy="plan",
+            site_used=0,
+            site_limit=0,
+            plugin_casts=0,
+            daily_limit=99,
+            slot=3,
+            slot_used=0,
+            per_slot=8,
+            max_per_run=40,
+        )
+        == 0
+    )
+
+
+def test_slot_plan_page_summary():
+    """详情页包含自定义计划的时段与数字摘要。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = [0, 0, 8, 0, 10, 0]
+    plugin._slot_plan_text = "0,0,8,0,10,0"
+
+    page_text = json.dumps(plugin.get_page(), ensure_ascii=False)
+
+    assert "自定义计划" in page_text
+    assert "0/0/8/0/10/0" in page_text
 
 
 _MISSING = object()
