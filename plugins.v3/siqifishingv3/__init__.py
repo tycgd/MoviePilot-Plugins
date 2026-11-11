@@ -26,7 +26,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -49,6 +49,9 @@ class SiQiFishingV3(_PluginBase):
     # 收集类任务保护：避免自动交付可重复小任务消耗收集任务必需的鱼
     PROTECT_COLLECTION_TASKS = True
     COLLECTION_TASK_MIN_REQUIREMENTS = 5
+
+    # 全收集任务（任务六·完全图鉴）判定：requirements 数量达到该值且无 unlock_rod
+    FULL_COLLECTION_MIN_REQUIREMENTS = 50
 
     # 滑轨甜蜜区：页面 CSS 中 40%-60% 为深蓝色，50% 颜色最深
     PERFECT_MIN = 0.45
@@ -104,7 +107,8 @@ class SiQiFishingV3(_PluginBase):
         "rod_fixed": {"type": "rod_fixed", "label": "固定鱼竿"},
         "auto_buy": {"type": "bool", "label": "自动补饵"},
         "dry_run": {"type": "bool", "label": "演练模式"},
-        "auto_task": {"type": "bool", "label": "自动交付任务"},
+        "auto_task": {"type": "bool", "label": "自动提交任务"},
+        "auto_full_collection_task": {"type": "bool", "label": "全收集任务自动提交"},
         "auto_guess": {"type": "bool", "label": "自动竞猜"},
         "slot_strategy": {
             "type": "enum",
@@ -171,6 +175,7 @@ class SiQiFishingV3(_PluginBase):
     _slider_jitter = 0.02
 
     _auto_task = True
+    _auto_full_collection_task = False
     _auto_guess = False
     _guess_value = 0
 
@@ -265,6 +270,9 @@ class SiQiFishingV3(_PluginBase):
         )
 
         self._auto_task = bool(config.get("auto_task", True))
+        self._auto_full_collection_task = bool(
+            config.get("auto_full_collection_task", False)
+        )
         self._auto_guess = bool(config.get("auto_guess", False))
         self._guess_value = max(0, self.__safe_int(config.get("guess_value"), 0))
 
@@ -788,8 +796,20 @@ class SiQiFishingV3(_PluginBase):
                                     "component": "VSwitch",
                                     "props": {
                                         "model": "auto_task",
-                                        "label": "自动交付任务",
-                                        "hint": "满足条件时自动交付解锁鱼竿",
+                                        "label": "自动提交任务",
+                                        "hint": "满足条件时自动提交（不含全收集任务）",
+                                    },
+                                },
+                            ),
+                            self.__form_col(
+                                12,
+                                3,
+                                {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "auto_full_collection_task",
+                                        "label": "全收集任务自动提交",
+                                        "hint": "默认关闭：任务六全图鉴建议手动兑换",
                                     },
                                 },
                             ),
@@ -885,6 +905,7 @@ class SiQiFishingV3(_PluginBase):
             "slider_center": self._slider_center,
             "slider_jitter": self._slider_jitter,
             "auto_task": self._auto_task,
+            "auto_full_collection_task": self._auto_full_collection_task,
             "auto_guess": self._auto_guess,
             "guess_value": self._guess_value,
             "slot_strategy": self._slot_strategy,
@@ -900,9 +921,9 @@ class SiQiFishingV3(_PluginBase):
         updated_at = state.get("updated_at") or ""
         if updated_at:
             try:
-                updated_at = datetime.fromtimestamp(float(updated_at)).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
+                updated_at = datetime.fromtimestamp(
+                    float(updated_at), tz=self.TZ_CN
+                ).strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 updated_at = str(updated_at)
 
@@ -949,6 +970,67 @@ class SiQiFishingV3(_PluginBase):
             "manual": f"每时段最多 {self._per_slot_casts} 次",
         }.get(self._slot_strategy, "不限制时段")
 
+        strategy_card = {
+            "component": "VCard",
+            "props": {
+                "variant": "outlined",
+                "rounded": "lg",
+                "elevation": "1",
+                "class": "mb-4 h-100",
+            },
+            "content": [
+                {
+                    "component": "VCardTitle",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {"component": "span", "text": "⚙️ 当前策略"},
+                        {"component": "VSpacer"},
+                        {
+                            "component": "VChip",
+                            "props": {
+                                "size": "small",
+                                "variant": "tonal",
+                                "color": "primary",
+                            },
+                            "text": "数值类选项请进配置页修改",
+                        },
+                    ],
+                },
+                {
+                    "component": "VCardText",
+                    "content": [
+                        self.__strategy_row("收竿方式", slider_info),
+                        self.__strategy_row("鱼饵策略", lure_info),
+                        self.__strategy_row("鱼竿策略", rod_info),
+                        self.__strategy_row("购饵", budget_info),
+                        self.__strategy_row(
+                            "任务提交",
+                            "自动提交可完成任务"
+                            if self._auto_task
+                            else "不自动提交",
+                        ),
+                        self.__strategy_row(
+                            "全收集任务",
+                            "自动提交"
+                            if self._auto_full_collection_task
+                            else "仅手动（推荐）",
+                        ),
+                        self.__strategy_row(
+                            "竞猜",
+                            f"自动竞猜 {self._guess_value} 条"
+                            if self._auto_guess
+                            else "不自动竞猜",
+                        ),
+                        self.__strategy_row("时段分配", slot_info),
+                        self.__strategy_row(
+                            "演练模式", "开启（只同步不抛竿）" if self._dry_run else "关闭"
+                        ),
+                        self.__strategy_row("任务缺口", self.__task_gap_text() or "无"),
+                    ],
+                },
+            ],
+        }
+
         return [
             self.__hero_card(
                 self.__remaining_casts(
@@ -965,61 +1047,52 @@ class SiQiFishingV3(_PluginBase):
                 updated_at,
                 daily.get("last_result", "") or state.get("last_message", ""),
             ),
-            self.__today_overview_card(),
-            self.__quick_actions_card(),
-            self.__strategy_tuning_card(),
-            self.__lure_table(lures, selected_lure),
-            self.__log_table(daily.get("history") or []),
             {
-                "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-4"},
+                "component": "VRow",
                 "content": [
                     {
-                        "component": "VCardTitle",
-                        "props": {"class": "d-flex align-center"},
-                        "content": [
-                            {"component": "span", "text": "⚙️ 当前策略"},
-                            {"component": "VSpacer"},
-                            {
-                                "component": "VChip",
-                                "props": {
-                                    "size": "small",
-                                    "variant": "tonal",
-                                    "color": "primary",
-                                },
-                                "text": "数值类选项请进配置页修改",
-                            },
-                        ],
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 7},
+                        "content": [self.__today_overview_card()],
                     },
                     {
-                        "component": "VCardText",
-                        "content": [
-                            self.__strategy_row("收竿方式", slider_info),
-                            self.__strategy_row("鱼饵策略", lure_info),
-                            self.__strategy_row("鱼竿策略", rod_info),
-                            self.__strategy_row("购饵", budget_info),
-                            self.__strategy_row(
-                                "任务交付",
-                                "自动交付可完成任务" if self._auto_task else "不自动交付",
-                            ),
-                            self.__strategy_row(
-                                "竞猜",
-                                f"自动竞猜 {self._guess_value} 条"
-                                if self._auto_guess
-                                else "不自动竞猜",
-                            ),
-                            self.__strategy_row("时段分配", slot_info),
-                            self.__strategy_row(
-                                "演练模式", "开启（只同步不抛竿）" if self._dry_run else "关闭"
-                            ),
-                            self.__strategy_row(
-                                "任务缺口", self.__task_gap_text() or "无"
-                            ),
-                        ],
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 5},
+                        "content": [self.__quick_actions_card()],
                     },
                 ],
             },
-            self.__quiz_card(state),
+            self.__strategy_tuning_card(),
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [self.__lure_table(lures, selected_lure)],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [self.__log_table(daily.get("history") or [])],
+                    },
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 7},
+                        "content": [strategy_card],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 5},
+                        "content": [self.__quiz_card(state)],
+                    },
+                ],
+            },
         ]
 
     def stop_service(self):
@@ -1290,7 +1363,12 @@ class SiQiFishingV3(_PluginBase):
         ]
         return {
             "component": "VCard",
-            "props": {"variant": "outlined", "class": "mb-4"},
+            "props": {
+                "variant": "outlined",
+                "rounded": "lg",
+                "elevation": "1",
+                "class": "mb-4 h-100",
+            },
             "content": [
                 {
                     "component": "VCardTitle",
@@ -1482,11 +1560,18 @@ class SiQiFishingV3(_PluginBase):
                 off_text="关闭演练",
             ),
             self.__toggle_row(
-                "自动交付任务",
+                "自动提交任务",
                 "auto_task",
                 self._auto_task,
-                on_text="开启自动交付",
-                off_text="关闭自动交付",
+                on_text="开启自动提交",
+                off_text="关闭自动提交",
+            ),
+            self.__toggle_row(
+                "全收集任务自动提交",
+                "auto_full_collection_task",
+                self._auto_full_collection_task,
+                on_text="开启全收集提交",
+                off_text="关闭全收集提交",
             ),
             self.__toggle_row(
                 "自动竞猜",
@@ -1499,7 +1584,12 @@ class SiQiFishingV3(_PluginBase):
         ]
         return {
             "component": "VCard",
-            "props": {"variant": "outlined", "class": "mb-4"},
+            "props": {
+                "variant": "outlined",
+                "rounded": "lg",
+                "elevation": "1",
+                "class": "mb-4",
+            },
             "content": [
                 {
                     "component": "VCardTitle",
@@ -1559,7 +1649,7 @@ class SiQiFishingV3(_PluginBase):
                     "props": {
                         "style": (
                             "display:block; font-size:14px; font-weight:700;"
-                            " color:#334155; margin-bottom:6px;"
+                            " color:#1d4ed8; margin-bottom:6px;"
                         )
                     },
                     "text": title,
@@ -1718,7 +1808,12 @@ class SiQiFishingV3(_PluginBase):
 
         return {
             "component": "VCard",
-            "props": {"variant": "outlined", "class": "mb-4"},
+            "props": {
+                "variant": "outlined",
+                "rounded": "lg",
+                "elevation": "1",
+                "class": "mb-4 h-100",
+            },
             "content": [
                 {
                     "component": "VCardTitle",
@@ -1834,7 +1929,12 @@ class SiQiFishingV3(_PluginBase):
             )
         return {
             "component": "VCard",
-            "props": {"variant": "outlined", "class": "mb-4"},
+            "props": {
+                "variant": "outlined",
+                "rounded": "lg",
+                "elevation": "1",
+                "class": "mb-4 h-100",
+            },
             "content": [
                 {
                     "component": "VCardTitle",
@@ -1911,7 +2011,12 @@ class SiQiFishingV3(_PluginBase):
             )
         return {
             "component": "VCard",
-            "props": {"variant": "outlined", "class": "mb-4"},
+            "props": {
+                "variant": "outlined",
+                "rounded": "lg",
+                "elevation": "1",
+                "class": "mb-4 h-100",
+            },
             "content": [
                 {
                     "component": "VCardTitle",
@@ -2014,7 +2119,12 @@ class SiQiFishingV3(_PluginBase):
             )
         return {
             "component": "VCard",
-            "props": {"variant": "outlined", "class": "mb-4"},
+            "props": {
+                "variant": "outlined",
+                "rounded": "lg",
+                "elevation": "1",
+                "class": "mb-4 h-100",
+            },
             "content": [
                 {
                     "component": "VCardTitle",
@@ -2787,6 +2897,20 @@ class SiQiFishingV3(_PluginBase):
             if not progress.get("ready"):
                 continue
             defn = self.__task_def(task_id)
+            rewards = defn.get("rewards") or {}
+            requirements = defn.get("requirements") or []
+            is_full_collection = (
+                isinstance(rewards, dict)
+                and not rewards.get("unlock_rod")
+                and isinstance(requirements, list)
+                and len(requirements) >= self.FULL_COLLECTION_MIN_REQUIREMENTS
+            )
+            if is_full_collection and not self._auto_full_collection_task:
+                self.__record(
+                    "skip",
+                    f"跳过全收集任务 {task_id}：默认需手动兑换，可在页面开启「全收集任务自动提交」",
+                )
+                continue
             if self.PROTECT_COLLECTION_TASKS and defn.get("repeatable"):
                 blocked_code = ""
                 for req in defn.get("requirements") or []:

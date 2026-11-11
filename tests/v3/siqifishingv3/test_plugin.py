@@ -160,6 +160,7 @@ def build_plugin(module):
     plugin._slider_jitter = 0.03
 
     plugin._auto_task = False
+    plugin._auto_full_collection_task = False
     plugin._auto_guess = False
     plugin._guess_value = 0
 
@@ -344,7 +345,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.3.2"
+    assert cls.plugin_version == "1.3.3"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -416,7 +417,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.3.2"
+    assert cls.plugin_version == "1.3.3"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1992,6 +1993,55 @@ def test_task6_without_rod_reward_not_protected(monkeypatch):
     text = plugin._SiQiFishingV3__task_gap_text()
     assert "任务六" not in text, text
     assert "任务一" in text, text
+
+
+def test_deliver_full_collection_requires_switch(monkeypatch):
+    """全收集任务（任务六）默认不自动提交，开启开关后才提交。"""
+    module = load_plugin_module()
+    tasks = {"6": {"progress": {"ready": True}, "status": "in_progress"}}
+    task_defs = {
+        "6": {
+            "repeatable": False,
+            "rewards": {"medal": 12},
+            "requirements": [{"code": i, "quantity": 1} for i in range(1, 60)],
+        }
+    }
+    fish = {str(i): 1 for i in range(1, 60)}
+    plugin = _task_plugin(
+        module, monkeypatch, tasks=tasks, task_defs=task_defs, fish=fish
+    )
+    ActionRequestUtils.reset(
+        responses={"deliver_task": [FakeResponse(payload={"success": True})]}
+    )
+
+    delivered = asyncio.run(
+        plugin._SiQiFishingV3__deliver_tasks(ActionRequestUtils())
+    )
+    assert delivered == 0, delivered
+    assert "deliver_task" not in ActionRequestUtils.actions, ActionRequestUtils.actions
+    assert any(
+        item.get("action") == "skip" for item in plugin._daily["history"]
+    ), plugin._daily["history"]
+
+    plugin._auto_full_collection_task = True
+    ActionRequestUtils.reset(
+        responses={"deliver_task": [FakeResponse(payload={"success": True})]}
+    )
+    delivered = asyncio.run(
+        plugin._SiQiFishingV3__deliver_tasks(ActionRequestUtils())
+    )
+    assert delivered == 1, delivered
+    assert "deliver_task" in ActionRequestUtils.actions
+
+
+def test_page_uses_grouped_layout():
+    """详情页应使用 VRow/VCol 双栏分组布局。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    page = plugin.get_page()
+    assert any(
+        isinstance(node, dict) and node.get("component") == "VRow" for node in page
+    ), page
 
 
 def test_page_lure_buttons_disabled_without_stock():
