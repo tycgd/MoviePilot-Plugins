@@ -345,7 +345,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.3.5"
+    assert cls.plugin_version == "1.3.6"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -417,7 +417,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.3.5"
+    assert cls.plugin_version == "1.3.6"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -1889,8 +1889,8 @@ def test_task_gap_text_lists_missing_species(monkeypatch):
     text = plugin._SiQiFishingV3__task_gap_text()
 
     assert "任务一" in text, text
-    assert "凤尾鱼" in text and "时段5" in text, text
-    assert "萨帕塔鱼" in text and "时段3" in text, text
+    assert "凤尾鱼" in text and "时段5·16:00-19:59" in text, text
+    assert "萨帕塔鱼" in text and "时段3·08:00-11:59" in text, text
     assert "code#37" in text, text
 
 
@@ -2134,6 +2134,28 @@ def _slot_static(name: str):
     return getattr(module.SiQiFishingV3, f"_SiQiFishingV3__{name}")
 
 
+def test_slot_range_mapping():
+    """SLOT_RANGES 1~6 精确映射出没区间，越界或非整数返回空串。"""
+    slot_range = _slot_static("slot_range")
+    compact = _slot_static("slot_compact_label")
+
+    expected = {
+        1: ("00-04", "00:00-03:59"),
+        2: ("04-08", "04:00-07:59"),
+        3: ("08-12", "08:00-11:59"),
+        4: ("12-16", "12:00-15:59"),
+        5: ("16-20", "16:00-19:59"),
+        6: ("20-24", "20:00-23:59"),
+    }
+    for slot, (compact_text, full_text) in expected.items():
+        assert compact(slot) == compact_text, slot
+        assert slot_range(slot) == full_text, slot
+
+    for bad in (0, 7, None, "3", "x"):
+        assert slot_range(bad) == "", bad
+        assert compact(bad) == "", bad
+
+
 def _plan_slot_casts(module):
     """取插件的时段配额规划函数。"""
     return getattr(module.SiQiFishingV3, "_SiQiFishingV3__plan_slot_casts")
@@ -2333,7 +2355,7 @@ def test_plan_site_used_dominates():
 
 
 def test_slot_grid_shape():
-    """6 格时段网格标出当前格、配额与未来格。"""
+    """6 格时段网格标出当前格、配额、区间与未来格。"""
     module = load_plugin_module()
     plugin = build_plugin(module)
     grid_fn = getattr(plugin, "_SiQiFishingV3__slot_grid")
@@ -2346,8 +2368,22 @@ def test_slot_grid_shape():
     current = grid[2]
     assert "#2563eb" in _node_style_text(current), current
     assert "▶" in _node_text(current)
+    assert "08:00-11:59" in _node_text(current)
     assert "0/6" in _node_text(current)
     assert "–" in _node_text(grid[5])
+
+    plan_grid = grid_fn({"1": 6, "2": 6}, 3, "plan", 8, 6, [1, 2, 3, 4, 5, 6])
+    assert len(plan_grid) == 6
+    ranges = [
+        "00:00-03:59",
+        "04:00-07:59",
+        "08:00-11:59",
+        "12:00-15:59",
+        "16:00-19:59",
+        "20:00-23:59",
+    ]
+    for cell, expected_range in zip(plan_grid, ranges):
+        assert expected_range in _node_text(cell), cell
 
     off_grid = grid_fn({"1": 6, "2": 6}, 3, "off", 8, 6)
     assert "–" in _node_text(off_grid[2])
@@ -2747,7 +2783,7 @@ def test_plan_slot_casts_plan_mode():
 
 
 def test_slot_plan_page_summary():
-    """详情页包含自定义计划的时段与数字摘要。"""
+    """详情页包含自定义计划的紧凑区间与数字摘要。"""
     module = load_plugin_module()
     plugin = build_plugin(module)
     plugin._slot_strategy = "plan"
@@ -2757,7 +2793,8 @@ def test_slot_plan_page_summary():
     page_text = json.dumps(plugin.get_page(), ensure_ascii=False)
 
     assert "自定义计划" in page_text
-    assert "0/0/8/0/10/0" in page_text
+    assert "00-04:0 / 04-08:0 / 08-12:8 / 12-16:0 / 16-20:10 / 20-24:0" in page_text
+    assert "共 18 竿" in page_text
 
 
 # ---------------------------------------------------------------------------
@@ -2919,6 +2956,21 @@ def test_adjust_slot_absolute_value():
     assert config["slot_strategy"] == "plan"
 
 
+def test_adjust_slot_message_has_range():
+    """adjust_slot 返回消息带上该时段的完整出没区间。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = [0, 0, 0, 0, 0, 0]
+    plugin._slot_plan_text = "0,0,0,0,0,0"
+    plugin._state.update({"attempts_limit": 0})
+    plugin._daily_cast_limit = 40
+
+    result = asyncio.run(plugin.api_adjust_slot({"slot": 3, "value": 5}))
+    assert result["success"] is True, result
+    assert "08:00-11:59" in str(result["message"]), result
+
+
 def test_adjust_slot_initializes_empty_plan(monkeypatch):
     """plan 模式空计划时先初始化，再叠加本次调整。"""
     module = load_plugin_module()
@@ -3077,6 +3129,16 @@ def test_form_slot_plan_hint_manual_only(monkeypatch):
     plugin = build_plugin(module)
     form_text = json.dumps(plugin.get_form()[0], ensure_ascii=False)
     assert "仅『手动分配』模式下生效" in form_text
+
+
+def test_form_slot_plan_hint_ranges(monkeypatch):
+    """配置页 slot_plan 提示包含 6 个时段的小时区间说明。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    plugin = build_plugin(module)
+    form_text = json.dumps(plugin.get_form()[0], ensure_ascii=False)
+    assert "00-04" in form_text
+    assert "20-24" in form_text
 
 
 _MISSING = object()

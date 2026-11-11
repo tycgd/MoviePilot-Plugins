@@ -27,7 +27,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.5"
+    plugin_version = "1.3.6"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -46,6 +46,16 @@ class SiQiFishingV3(_PluginBase):
 
     FISHING_DATA_MARKER = "const FISHING_DATA = "
     DAILY_HISTORY_LIMIT = 30
+
+    # 时段出没时间（GMT+8）：每 4 小时一段；(紧凑小时区间, 完整时间区间)，仅用于显示
+    SLOT_RANGES: Dict[int, Tuple[str, str]] = {
+        1: ("00-04", "00:00-03:59"),
+        2: ("04-08", "04:00-07:59"),
+        3: ("08-12", "08:00-11:59"),
+        4: ("12-16", "12:00-15:59"),
+        5: ("16-20", "16:00-19:59"),
+        6: ("20-24", "20:00-23:59"),
+    }
 
     # 收集类任务保护：避免自动交付可重复小任务消耗收集任务必需的鱼
     PROTECT_COLLECTION_TASKS = True
@@ -914,7 +924,11 @@ class SiQiFishingV3(_PluginBase):
                                     "props": {
                                         "model": "slot_plan",
                                         "label": "分时段次数（1~6时段）",
-                                        "hint": "6 个整数逗号分隔，0=不钓；仅『手动分配』模式下生效",
+                                        "hint": (
+                                            "6 个整数逗号分隔，依次对应 00-04、04-08、"
+                                            "08-12、12-16、16-20、20-24（GMT+8），0=不钓；"
+                                            "仅『手动分配』模式下生效"
+                                        ),
                                     },
                                 },
                             ),
@@ -1010,8 +1024,13 @@ class SiQiFishingV3(_PluginBase):
             "auto": "自动平均分配",
             "manual": f"每时段最多 {self._per_slot_casts} 次",
             "plan": (
-                f"自定义计划 {'/'.join(str(v) for v in self._slot_plan)}"
-                f"（共 {sum(self._slot_plan)} 竿）"
+                "自定义计划 "
+                + " / ".join(
+                    f"{self.__slot_compact_label(i + 1)}:"
+                    f"{(self._slot_plan[i] if i < len(self._slot_plan) else 0)}"
+                    for i in range(6)
+                )
+                + f"（共 {sum(self._slot_plan)} 竿）"
                 if self._slot_plan
                 else "自定义计划（未填写）"
             ),
@@ -1467,11 +1486,16 @@ class SiQiFishingV3(_PluginBase):
             for mode in ("perfect", "range", "custom")
         ]
 
+        plan_text_parts = [
+            f"{self.__slot_compact_label(i + 1)}:"
+            f"{(self._slot_plan[i] if i < len(self._slot_plan) else 0)}"
+            for i in range(6)
+        ]
         slot_text = {
             "auto": "自动平均",
             "manual": f"手动 {self._per_slot_casts} 次",
             "plan": (
-                f"自定义 {'/'.join(str(v) for v in self._slot_plan)}"
+                f"自定义 {' / '.join(plan_text_parts)}"
                 if self._slot_plan
                 else "自定义（未填写）"
             ),
@@ -1853,14 +1877,18 @@ class SiQiFishingV3(_PluginBase):
         if slot_strategy == "auto":
             slot_summary = (
                 f"自动分配：剩余 {slot_remaining} 次 ÷ {slot_left} 时段"
-                f" ≈ {quota} 竿/时段（含当前）"
+                f" ≈ {quota} 竿/时段（含当前 {self.__slot_range(slot_no)}）"
             )
         elif slot_strategy == "manual":
             slot_summary = f"手动：每时段 {self._per_slot_casts} 次（配置页修改）"
         elif slot_strategy == "plan":
             slot_summary = (
-                f"自定义计划：时段1-6 = {'/'.join(str(v) for v in plan_display)}"
-                f"（共 {plan_total} 竿）"
+                "自定义计划："
+                + " / ".join(
+                    f"{self.__slot_compact_label(i + 1)}:{plan_display[i]}"
+                    for i in range(6)
+                )
+                + f"（共 {plan_total} 竿）"
             )
         else:
             slot_summary = "不限时段"
@@ -2024,7 +2052,7 @@ class SiQiFishingV3(_PluginBase):
                                     + (
                                         "repeat(auto-fit,minmax(110px,1fr));"
                                         if slot_strategy == "plan"
-                                        else "repeat(auto-fit,minmax(72px,1fr));"
+                                        else "repeat(auto-fit,minmax(84px,1fr));"
                                     )
                                     + " gap:6px; margin-top:10px;"
                                 )
@@ -2588,7 +2616,10 @@ class SiQiFishingV3(_PluginBase):
             self._slot_plan_text = plan_text
 
         total = sum(plan)
-        message = f"时段{slot}已调整为 {new_value} 竿（共 {total} 竿）"
+        message = (
+            f"时段{slot}（{self.__slot_range(slot)}）已调整为 {new_value} 竿"
+            f"（共 {total} 竿）"
+        )
         if total == 0:
             message += "；计划总数为 0，今日将不抛竿"
         logger.info(f"思齐钓鱼：时段{slot}计划已调整为 {new_value} 竿")
@@ -3155,7 +3186,13 @@ class SiQiFishingV3(_PluginBase):
                 if not name or name == "未知":
                     name = f"code#{code}"
                 slot = meta.get("time_slot")
-                slot_text = "" if slot is None or str(slot) == "" else f"(时段{slot})"
+                if slot is None or str(slot) == "":
+                    slot_text = ""
+                else:
+                    range_text = self.__slot_range(slot)
+                    slot_text = (
+                        f"(时段{slot}·{range_text})" if range_text else f"(时段{slot})"
+                    )
                 missing.append(f"{name}{slot_text}")
             if missing:
                 parts.append(
@@ -3676,6 +3713,13 @@ class SiQiFishingV3(_PluginBase):
     ) -> str:
         """时段配额耗尽时的停止原因：配额分母复用同一套推导，避免与限流逻辑漂移。"""
         slot_used = max(0, self.__safe_int(slot_used, 0))
+        try:
+            next_slot = int(slot) + 1
+        except (TypeError, ValueError):
+            next_slot = 0
+        if next_slot < 1 or next_slot > 6:
+            next_slot = 1
+        next_range = self.__slot_range(next_slot)
         if self._slot_strategy == "auto":
             cap = self.__slot_quota(
                 self.__remaining_casts(
@@ -3683,18 +3727,18 @@ class SiQiFishingV3(_PluginBase):
                 ),
                 self.__slots_left(slot),
             )
-            return f"本时段配额已用完（{slot_used}/{cap}），下一时段自动恢复"
+            return f"本时段配额已用完（{slot_used}/{cap}），下一时段（{next_range}）自动恢复"
         if self._slot_strategy == "manual":
             cap = max(0, self.__safe_int(self._per_slot_casts, 0))
-            return f"本时段配额已用完（{slot_used}/{cap}），下一时段自动恢复"
+            return f"本时段配额已用完（{slot_used}/{cap}），下一时段（{next_range}）自动恢复"
         if self._slot_strategy == "plan":
             plan = self._slot_plan or []
             planned = plan[slot - 1] if 1 <= slot <= len(plan) else 0
             planned = self.__safe_int(planned, 0)
             if planned <= 0:
                 return "本时段计划不钓（0 竿）"
-            return f"本时段计划已用完（{slot_used}/{planned}），下一时段按计划恢复"
-        return f"本时段配额已用完（已用 {slot_used} 竿），下一时段自动恢复"
+            return f"本时段计划已用完（{slot_used}/{planned}），下一时段（{next_range}）按计划恢复"
+        return f"本时段配额已用完（已用 {slot_used} 竿），下一时段（{next_range}）自动恢复"
 
     def __slot_grid(
         self,
@@ -3755,6 +3799,13 @@ class SiQiFishingV3(_PluginBase):
                                 "text": (
                                     f"▶ 时段{index}" if highlighted else f"时段{index}"
                                 ),
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size:10px; opacity:0.8; line-height:1.2;"
+                                },
+                                "text": self.__slot_range(index),
                             },
                             {"component": "div", "text": f"{planned} 竿"},
                             {
@@ -3824,6 +3875,13 @@ class SiQiFishingV3(_PluginBase):
                             },
                             {
                                 "component": "div",
+                                "props": {
+                                    "style": "font-size:10px; opacity:0.8; line-height:1.2;"
+                                },
+                                "text": self.__slot_range(index),
+                            },
+                            {
+                                "component": "div",
                                 "text": f"{used}/{cap_text}",
                             },
                         ],
@@ -3882,6 +3940,22 @@ class SiQiFishingV3(_PluginBase):
     def __time_slot(hour: int) -> int:
         """返回 GMT+8 当天所属时段序号（每 4 小时一段，1~6）。"""
         return SiQiFishingV3.__safe_int(hour, 0) // 4 + 1
+
+    @staticmethod
+    def __slot_range(slot: int) -> str:
+        """返回时段完整出没区间（如 08:00-11:59），非法时段返回空串；仅用于显示。"""
+        if isinstance(slot, bool) or not isinstance(slot, int):
+            return ""
+        entry = SiQiFishingV3.SLOT_RANGES.get(slot)
+        return entry[1] if entry else ""
+
+    @staticmethod
+    def __slot_compact_label(slot: int) -> str:
+        """返回时段紧凑小时区间（如 08-12），非法时段返回空串；仅用于显示。"""
+        if isinstance(slot, bool) or not isinstance(slot, int):
+            return ""
+        entry = SiQiFishingV3.SLOT_RANGES.get(slot)
+        return entry[0] if entry else ""
 
     def __record(self, action: str, detail: str) -> None:
         history = list(self._daily.get("history") or [])
