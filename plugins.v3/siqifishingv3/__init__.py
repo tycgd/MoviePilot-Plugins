@@ -27,7 +27,7 @@ class SiQiFishingV3(_PluginBase):
     plugin_name = "思齐钓鱼"
     plugin_desc = "自动抛竿收竿（可调完美/随机/自定义），鱼饵鱼竿策略、补饵预算、任务交付与竞猜均可自由配置。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.6"
+    plugin_version = "1.3.7"
     plugin_author = "tycgd"
     author_url = "https://github.com/tycgd"
     plugin_config_prefix = "siqifishingv3_"
@@ -162,7 +162,7 @@ class SiQiFishingV3(_PluginBase):
 
     _enabled = False
     _cookie = ""
-    _schedule_mode = "interval"
+    _schedule_mode = "slot"
     _cron = "7 */2 * * *"
     _interval_minutes = 61
     _notify = True
@@ -196,7 +196,7 @@ class SiQiFishingV3(_PluginBase):
     _slot_plan: List[int] = []
     _slot_plan_text = ""
 
-    ONCE_JOB_IDS = ("run_once", "api_run_once", "command_run_once")
+    ONCE_JOB_IDS = ("run_once", "api_run_once", "command_run_once", "slot_continue")
 
     _lock: Optional[asyncio.Lock] = None
     _slot_lock: Optional[asyncio.Lock] = None
@@ -242,7 +242,7 @@ class SiQiFishingV3(_PluginBase):
 
         self._enabled = bool(config.get("enabled", False))
         self._cookie = (config.get("cookie") or site_cookie or "").strip()
-        self._schedule_mode = config.get("schedule_mode", "interval")
+        self._schedule_mode = config.get("schedule_mode", "slot")
         self._cron = (config.get("cron") or "7 */2 * * *").strip()
         self._interval_minutes = min(
             self.MAX_INTERVAL_MINUTES,
@@ -305,6 +305,26 @@ class SiQiFishingV3(_PluginBase):
             self._slot_strategy = "auto"
         else:
             self._slot_strategy = slot_strategy
+
+        # 旧默认配置（interval + 61 分钟 + 默认 cron + 分时段计划）自动迁移为按时段计划调度。
+        # 用原始 config 值判断，勿用已被 clamp 且补 61 的 self._interval_minutes。
+        raw_mode = str(config.get("schedule_mode") or "").strip().lower()
+        raw_interval = config.get("interval_minutes")
+        raw_cron = (config.get("cron") or "").strip()
+        if (
+            raw_mode == "interval"
+            and (
+                raw_interval is None
+                or self.__safe_int(raw_interval, 61) == 61
+            )
+            and (not raw_cron or raw_cron == "7 */2 * * *")
+            and self._slot_strategy == "plan"
+            and self._slot_plan
+        ):
+            self._schedule_mode = "slot"
+            logger.info(
+                "思齐钓鱼：检测到默认间隔配置 + 分时段计划，已迁移为按时段计划调度"
+            )
         self._per_slot_casts = max(
             1, self.__safe_int(config.get("per_slot_casts"), 8, min_value=1)
         )
@@ -439,7 +459,14 @@ class SiQiFishingV3(_PluginBase):
         if not self._enabled:
             return []
 
-        if self._schedule_mode == "interval":
+        if self._schedule_mode == "slot":
+            try:
+                trigger = CronTrigger.from_crontab("1 0,4,8,12,16,20 * * *")
+                logger.info("思齐钓鱼：使用时段计划触发器（0/4/8/12/16/20 点）")
+            except Exception as e:
+                logger.warning(f"思齐钓鱼：时段计划触发器创建失败：{e}")
+                return []
+        elif self._schedule_mode == "interval":
             try:
                 trigger = IntervalTrigger(minutes=self._interval_minutes)
                 logger.info(f"思齐钓鱼：使用间隔触发器，每 {self._interval_minutes} 分钟")
@@ -542,6 +569,15 @@ class SiQiFishingV3(_PluginBase):
                         },
                     },
                     {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "class": "mb-3",
+                            "text": "按时段计划：每天 0/4/8/12/16/20 点后 1 分钟各运行一次，跑完当时段计划即静默，空跑不产生任何记录",
+                        },
+                    },
+                    {
                         "component": "VRow",
                         "content": [
                             self.__form_col(
@@ -553,6 +589,10 @@ class SiQiFishingV3(_PluginBase):
                                         "model": "schedule_mode",
                                         "label": "定时模式",
                                         "items": [
+                                            {
+                                                "title": "按时段计划（推荐）",
+                                                "value": "slot",
+                                            },
                                             {"title": "Cron表达式", "value": "cron"},
                                             {"title": "固定间隔(分钟)", "value": "interval"},
                                         ],
@@ -583,7 +623,7 @@ class SiQiFishingV3(_PluginBase):
                                         "type": "number",
                                         "min": 1,
                                         "value": 61,
-                                        "hint": "间隔模式下生效",
+                                        "hint": "仅固定间隔模式生效",
                                     },
                                 },
                             ),
@@ -994,7 +1034,9 @@ class SiQiFishingV3(_PluginBase):
             if isinstance(v, (int, float))
         )
 
-        if self._schedule_mode == "interval":
+        if self._schedule_mode == "slot":
+            schedule_info = "按时段计划（0/4/8/12/16/20 点）"
+        elif self._schedule_mode == "interval":
             schedule_info = f"每 {self._interval_minutes} 分钟"
         else:
             schedule_info = f"Cron: {self._cron}"
@@ -2745,13 +2787,10 @@ class SiQiFishingV3(_PluginBase):
             self.__record("sync", result["message"])
             return
 
-        # 本时段配额已用完且没有可交付任务时，静默跳过：不抛竿、不写 run 记录、不发通知。
-        tasks_ready = sum(
-            1
-            for info in (self._state.get("tasks") or {}).values()
-            if isinstance(info, dict) and (info.get("progress") or {}).get("ready")
-        )
-        if tasks_ready == 0:
+        # 只有计划/命令/API run_once 路径（casts_limit 为 None）才做时段静默早退；
+        # 快捷抛竿（fish_now 传 casts_limit）永不被时段静默吞掉。
+        skip_casting = False
+        if casts_limit is None:
             now_cn = datetime.now(self.TZ_CN)
             slot_no = self.__time_slot(now_cn.hour)
             slots_map = self._daily.get("slots")
@@ -2776,7 +2815,12 @@ class SiQiFishingV3(_PluginBase):
                 max_per_run=self._max_casts_per_run,
                 slot_plan=self._slot_plan,
             )
-            if allowed_now <= 0:
+            actionable = (
+                self.__actionable_task_ids()
+                if (allow_deliver and self._auto_task)
+                else []
+            )
+            if allowed_now <= 0 and not actionable:
                 remaining_now = self.__remaining_casts(
                     attempts_used_now,
                     attempts_limit_now,
@@ -2799,16 +2843,36 @@ class SiQiFishingV3(_PluginBase):
                         + "，静默跳过"
                     )
                 return
+            if allowed_now <= 0:
+                skip_casting = True
 
-        if allow_guess and self._auto_guess:
-            await self.__submit_guess(client)
+        if not skip_casting:
+            if allow_guess and self._auto_guess:
+                await self.__submit_guess(client)
 
-        await self.__ensure_lure(client, allow_buy=allow_buy)
-        await self.__ensure_rod(client)
+            await self.__ensure_lure(client, allow_buy=allow_buy)
+            await self.__ensure_rod(client)
 
-        cast_result = await self.__cast_loop(
-            client, max_casts=casts_limit, interval=interval_override
-        )
+            cast_result = await self.__cast_loop(
+                client, max_casts=casts_limit, interval=interval_override
+            )
+        else:
+            cast_result = {
+                "casts": 0,
+                "caught": 0,
+                "new_discoveries": 0,
+                "misses": 0,
+                "miss_rewards": 0,
+                "remaining": self.__remaining_casts(
+                    self.__safe_int(self._state.get("attempts_used"), 0),
+                    self.__safe_int(self._state.get("attempts_limit"), 0),
+                    self.__safe_int(self._daily.get("casts"), 0),
+                    self._daily_cast_limit,
+                ),
+                "status": "completed",
+                "failure": "",
+            }
+
         result["data"]["casts"] = cast_result["casts"]
         result["data"]["caught"] = cast_result["caught"]
         result["data"]["new_discoveries"] = cast_result["new_discoveries"]
@@ -2820,23 +2884,75 @@ class SiQiFishingV3(_PluginBase):
             delivered = await self.__deliver_tasks(client)
             result["data"]["delivered"] = delivered
 
-        summary = (
-            f"抛竿 {cast_result['casts']} 次，钓到 {cast_result['caught']} 条"
-            f"（新发现 {cast_result['new_discoveries']} 种），"
-            f"剩余次数 {max(0, cast_result['remaining'])}"
-        )
-        if result["data"].get("delivered"):
-            summary += f"，交付任务 {result['data']['delivered']} 个"
-        if cast_result.get("failure"):
-            summary += f"；停止原因：{cast_result['failure']}"
-        gap = self.__task_gap_text()
-        if gap:
-            summary += f"；任务缺口：{gap}"
+        casts_n = cast_result["casts"]
+        delivered_n = result["data"].get("delivered") or 0
+        if skip_casting and delivered_n > 0:
+            summary = f"本时段无抛竿配额，交付任务 {delivered_n} 个"
+        else:
+            summary = (
+                f"抛竿 {cast_result['casts']} 次，钓到 {cast_result['caught']} 条"
+                f"（新发现 {cast_result['new_discoveries']} 种），"
+                f"剩余次数 {max(0, cast_result['remaining'])}"
+            )
+            if result["data"].get("delivered"):
+                summary += f"，交付任务 {result['data']['delivered']} 个"
+            if cast_result.get("failure"):
+                summary += f"；停止原因：{cast_result['failure']}"
 
         result["status"] = cast_result["status"]
         result["message"] = summary
-        self._daily["last_result"] = summary
-        self.__record("run", summary)
+        if casts_n > 0 or delivered_n > 0 or result["status"] == "failed":
+            self._daily["last_result"] = summary
+            self.__record("run", summary)
+        else:
+            result["silent"] = True
+
+        # 时段续跑：仅计划型运行 + slot 调度模式下，本轮跑满单轮上限且自然结束才续跑。
+        if (
+            casts_limit is None
+            and self._schedule_mode == "slot"
+            and cast_result["casts"] > 0
+            and not cast_result.get("failure")
+            and cast_result["casts"] >= self._max_casts_per_run
+        ):
+            now_cn = datetime.now(self.TZ_CN)
+            slot_no = self.__time_slot(now_cn.hour)
+            slots_map = self._daily.get("slots")
+            slot_used = self.__safe_int(
+                (slots_map or {}).get(str(slot_no))
+                if isinstance(slots_map, dict)
+                else 0,
+                0,
+            )
+            allowed_next = self.__plan_slot_casts(
+                strategy=self._slot_strategy,
+                site_used=self.__safe_int(self._state.get("attempts_used"), 0),
+                site_limit=self.__safe_int(self._state.get("attempts_limit"), 0),
+                plugin_casts=self.__safe_int(self._daily.get("casts"), 0),
+                daily_limit=self._daily_cast_limit,
+                slot=slot_no,
+                slot_used=slot_used,
+                per_slot=self._per_slot_casts,
+                max_per_run=self._max_casts_per_run,
+                slot_plan=self._slot_plan,
+            )
+            site_remaining = self.__remaining_casts(
+                self.__safe_int(self._state.get("attempts_used"), 0),
+                self.__safe_int(self._state.get("attempts_limit"), 0),
+                self.__safe_int(self._daily.get("casts"), 0),
+                self._daily_cast_limit,
+            )
+            if allowed_next > 0 and site_remaining > 0:
+                try:
+                    scheduler_sdk.add_plugin_once_job(
+                        self.__class__.__name__,
+                        "slot_continue",
+                        self.run_fishing_task,
+                        "思齐钓鱼时段续跑",
+                        delay_seconds=max(30, self._cast_interval * 2),
+                    )
+                except Exception as e:
+                    logger.warning(f"思齐钓鱼：注册时段续跑任务失败：{e}")
 
     async def __cast_loop(
         self,
@@ -3142,6 +3258,56 @@ class SiQiFishingV3(_PluginBase):
             codes.update(self.__task_required_codes(defn))
         return codes
 
+    def __task_skip_reason(self, task_id: Any) -> str:
+        """返回任务不可交付的原因字符串（空串表示可交付），纯判定无副作用。"""
+        defn = self.__task_def(task_id)
+        rewards = defn.get("rewards") or {}
+        requirements = defn.get("requirements") or []
+        is_full_collection = (
+            isinstance(rewards, dict)
+            and not rewards.get("unlock_rod")
+            and isinstance(requirements, list)
+            and len(requirements) >= self.FULL_COLLECTION_MIN_REQUIREMENTS
+        )
+        if is_full_collection and not self._auto_full_collection_task:
+            return "全收集任务默认需手动兑换，可在页面开启「全收集任务自动提交」"
+        if self.PROTECT_COLLECTION_TASKS and defn.get("repeatable"):
+            protected = self.__protected_collection_codes()
+            for req in requirements:
+                if not isinstance(req, dict) or req.get("code") is None:
+                    continue
+                code = str(req.get("code"))
+                need = self.__safe_int(req.get("quantity"), 1, 1)
+                if code in protected and self.__fish_qty(code) <= need:
+                    return f"会消耗收集任务必需的鱼 {code}"
+        return ""
+
+    def __actionable_task_ids(self) -> List[str]:
+        """返回真正可交付的 ready 任务，排序与 __deliver_tasks 原逻辑一致。"""
+        tasks = self._state.get("tasks") or {}
+        if not isinstance(tasks, dict):
+            return []
+        ordered = sorted(
+            tasks,
+            key=lambda tid: (
+                1 if (self.__task_def(tid) or {}).get("repeatable") else 0,
+                self.__safe_int(tid, 0),
+            ),
+        )
+        out: List[str] = []
+        for task_id in ordered:
+            info = tasks.get(task_id)
+            if not isinstance(info, dict):
+                continue
+            if not (info.get("progress") or {}).get("ready"):
+                continue
+            reason = self.__task_skip_reason(task_id)
+            if reason:
+                logger.debug(f"思齐钓鱼：跳过交付任务 {task_id}：{reason}")
+                continue
+            out.append(task_id)
+        return out
+
     def __task_gap_text(self, limit: int = 3) -> str:
         """汇总非重复未完成收集任务的缺口：缺哪种鱼、需求时段。"""
         defs = self._state.get("task_defs") or {}
@@ -3203,58 +3369,8 @@ class SiQiFishingV3(_PluginBase):
         return "；".join(parts)
 
     async def __deliver_tasks(self, client: AsyncRequestUtils) -> int:
-        tasks = self._state.get("tasks") or {}
         delivered = 0
-        protected = (
-            self.__protected_collection_codes()
-            if self.PROTECT_COLLECTION_TASKS
-            else set()
-        )
-        ordered = sorted(
-            tasks,
-            key=lambda tid: (
-                1 if (self.__task_def(tid) or {}).get("repeatable") else 0,
-                self.__safe_int(tid, 0),
-            ),
-        )
-        for task_id in ordered:
-            info = tasks.get(task_id)
-            if not isinstance(info, dict):
-                continue
-            progress = info.get("progress") or {}
-            if not progress.get("ready"):
-                continue
-            defn = self.__task_def(task_id)
-            rewards = defn.get("rewards") or {}
-            requirements = defn.get("requirements") or []
-            is_full_collection = (
-                isinstance(rewards, dict)
-                and not rewards.get("unlock_rod")
-                and isinstance(requirements, list)
-                and len(requirements) >= self.FULL_COLLECTION_MIN_REQUIREMENTS
-            )
-            if is_full_collection and not self._auto_full_collection_task:
-                self.__record(
-                    "skip",
-                    f"跳过全收集任务 {task_id}：默认需手动兑换，可在页面开启「全收集任务自动提交」",
-                )
-                continue
-            if self.PROTECT_COLLECTION_TASKS and defn.get("repeatable"):
-                blocked_code = ""
-                for req in defn.get("requirements") or []:
-                    if not isinstance(req, dict) or req.get("code") is None:
-                        continue
-                    code = str(req.get("code"))
-                    need = self.__safe_int(req.get("quantity"), 1, 1)
-                    if code in protected and self.__fish_qty(code) <= need:
-                        blocked_code = code
-                        break
-                if blocked_code:
-                    self.__record(
-                        "skip",
-                        f"跳过交付任务 {task_id}：会消耗收集任务必需的鱼 {blocked_code}",
-                    )
-                    continue
+        for task_id in self.__actionable_task_ids():
             payload = await self.__post_action(
                 client, "deliver_task", task_id=self.__safe_int(task_id, 0)
             )

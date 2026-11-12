@@ -345,7 +345,7 @@ def test_metadata_matches_directory():
 
     assert cls.__name__.lower() == PLUGIN_INIT.parent.name
     assert PLUGIN_INIT.parent.name == "siqifishingv3"
-    assert cls.plugin_version == "1.3.6"
+    assert cls.plugin_version == "1.3.7"
     assert cls.plugin_config_prefix == "siqifishingv3_"
     assert cls.plugin_author == "tycgd"
     assert cls.auth_level == 1
@@ -417,7 +417,7 @@ def test_version_consistency():
     package = json.loads((PLUGIN_INIT.parents[2] / "package.v3.json").read_text("utf-8"))
     entry = package[cls.__name__]
 
-    assert cls.plugin_version == "1.3.6"
+    assert cls.plugin_version == "1.3.7"
     assert entry["version"] == cls.plugin_version
     assert next(iter(entry["history"])) == f"v{cls.plugin_version}"
 
@@ -883,6 +883,8 @@ def test_stop_service_removes_jobs(monkeypatch):
 
     expected = ["run_once", "api_run_once", "command_run_once"]
     assert removed[:3] == expected
+    assert "slot_continue" in removed
+    assert removed[:4] == expected + ["slot_continue"]
     assert plugin._lock is None
 
 
@@ -1764,7 +1766,7 @@ _COLLECTION_DEFS = {
 
 
 def test_deliver_skips_repeatable_task_consuming_collection_fish(monkeypatch):
-    """可重复任务的交付会消耗收集任务必需的鱼时，应跳过并记录 skip。"""
+    """可重复任务的交付会消耗收集任务必需的鱼时，应跳过且不写 skip 记录。"""
     module = load_plugin_module()
     tasks = {
         "1": {"progress": {"ready": False}, "status": "in_progress"},
@@ -1787,9 +1789,8 @@ def test_deliver_skips_repeatable_task_consuming_collection_fish(monkeypatch):
 
     assert delivered == 0, delivered
     assert "deliver_task" not in ActionRequestUtils.actions, ActionRequestUtils.actions
-    detail = json.dumps(plugin._daily["history"], ensure_ascii=False)
-    assert "跳过交付任务 7" in detail, detail
-    assert "skip" in [item.get("action") for item in plugin._daily["history"]]
+    assert plugin._daily["history"] == [], plugin._daily["history"]
+    assert "skip" not in [item.get("action") for item in plugin._daily["history"]]
 
 
 def test_deliver_allows_repeatable_when_surplus(monkeypatch):
@@ -1942,6 +1943,11 @@ def test_execute_still_delivers_ready_tasks_when_slot_exhausted(monkeypatch):
 
     assert "deliver_task" in ActionRequestUtils.actions
     assert result["status"] in ("completed", "partial"), result
+    actions = [item.get("action") for item in plugin._daily["history"]]
+    assert "task" in actions, actions
+    assert "run" in actions, actions
+    assert "skip" not in actions, actions
+    assert "本时段无抛竿配额" in result["message"], result
 
 
 def test_task6_without_rod_reward_not_protected(monkeypatch):
@@ -2021,9 +2027,7 @@ def test_deliver_full_collection_requires_switch(monkeypatch):
     )
     assert delivered == 0, delivered
     assert "deliver_task" not in ActionRequestUtils.actions, ActionRequestUtils.actions
-    assert any(
-        item.get("action") == "skip" for item in plugin._daily["history"]
-    ), plugin._daily["history"]
+    assert plugin._daily["history"] == [], plugin._daily["history"]
 
     plugin._auto_full_collection_task = True
     ActionRequestUtils.reset(
@@ -3139,6 +3143,258 @@ def test_form_slot_plan_hint_ranges(monkeypatch):
     form_text = json.dumps(plugin.get_form()[0], ensure_ascii=False)
     assert "00-04" in form_text
     assert "20-24" in form_text
+
+
+def test_get_service_slot_cron_trigger():
+    """slot 模式返回时段 CronTrigger（0/4/8/12/16/20 点 :01），interval 仍返回 IntervalTrigger。"""
+    module = load_plugin_module()
+    plugin = build_plugin(module)
+    plugin._enabled = True
+
+    plugin._schedule_mode = "slot"
+    (service,) = plugin.get_service()
+    trigger = service["trigger"]
+    assert isinstance(trigger, module.CronTrigger)
+    fields = {field.name: str(field) for field in trigger.fields}
+    assert fields["hour"] == "0,4,8,12,16,20", fields
+    assert fields["minute"] == "1", fields
+
+    plugin._schedule_mode = "interval"
+    (service_i,) = plugin.get_service()
+    assert isinstance(service_i["trigger"], module.IntervalTrigger)
+
+
+def test_default_schedule_mode_is_slot(monkeypatch):
+    """init_plugin 缺省 schedule_mode 时默认 slot。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    monkeypatch.setattr(
+        module.scheduler_sdk, "add_plugin_once_job", lambda *a, **k: None
+    )
+    plugin = build_plugin(module)
+    plugin.init_plugin({})
+    assert plugin._schedule_mode == "slot"
+
+
+def test_init_plugin_migrates_default_interval_plan_to_slot(monkeypatch):
+    """默认 interval+61+默认 cron+分时段计划，迁移为 slot。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    monkeypatch.setattr(
+        module.scheduler_sdk, "add_plugin_once_job", lambda *a, **k: None
+    )
+    plugin = build_plugin(module)
+    plugin.init_plugin(
+        {
+            "enabled": True,
+            "schedule_mode": "interval",
+            "interval_minutes": 61,
+            "cron": "7 */2 * * *",
+            "slot_strategy": "plan",
+            "slot_plan": "0,6,0,6,0,6",
+        }
+    )
+    assert plugin._schedule_mode == "slot"
+
+
+def test_init_plugin_keeps_custom_interval(monkeypatch):
+    """非默认 interval（90）或自定义 cron 或非 plan 时不迁移。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    monkeypatch.setattr(
+        module.scheduler_sdk, "add_plugin_once_job", lambda *a, **k: None
+    )
+    base = {
+        "enabled": True,
+        "schedule_mode": "interval",
+        "cron": "7 */2 * * *",
+        "slot_strategy": "plan",
+        "slot_plan": "0,6,0,6,0,6",
+    }
+
+    p1 = build_plugin(module)
+    p1.init_plugin({**base, "interval_minutes": 90})
+    assert p1._schedule_mode == "interval"
+    assert p1._interval_minutes == 90
+
+    p2 = build_plugin(module)
+    p2.init_plugin({**base, "interval_minutes": 61, "cron": "9 */3 * * *"})
+    assert p2._schedule_mode == "interval"
+
+    p3 = build_plugin(module)
+    p3.init_plugin({**base, "interval_minutes": 61, "slot_strategy": "manual"})
+    assert p3._schedule_mode == "interval"
+
+
+def test_execute_silent_when_no_actionable_even_with_ready_tasks(monkeypatch):
+    """时段耗尽且仅剩被保护拦截的 ready 任务时完全静默：不抛竿、不交付、不记录、不通知。"""
+    module = load_plugin_module()
+    slot = _current_slot(module)
+    data = make_data(
+        tasks={
+            "1": {"progress": {"ready": False}, "status": "in_progress"},
+            "7": {"progress": {"ready": True}, "status": "in_progress"},
+        }
+    )
+    data["config"]["tasks"] = _COLLECTION_DEFS
+    data["inventory"]["fish"] = {"1": 1, "2": 1, "3": 1, "103": 0}
+    sent = []
+
+    def configure(plugin):
+        plugin._auto_guess = False
+        plugin._auto_task = True
+        plugin._auto_full_collection_task = False
+        plugin._notify = True
+        plugin._slot_strategy = "auto"
+        plugin._daily["date"] = _today(module)
+        plugin._daily["slots"] = {str(slot): 99}
+        plugin.post_message = lambda **kwargs: sent.append(kwargs)
+
+    plugin, result = _run_task(module, monkeypatch, data=data, configure=configure)
+
+    assert result.get("silent") is True, result
+    assert "perform_fishing" not in ActionRequestUtils.actions
+    assert "deliver_task" not in ActionRequestUtils.actions
+    actions = [item.get("action") for item in plugin._daily["history"]]
+    assert "run" not in actions, actions
+    assert "skip" not in actions, actions
+    assert sent == [], sent
+
+
+def test_run_summary_has_no_task_gap(monkeypatch):
+    """run 摘要与记录不再拼接「任务缺口」，但缺口文案本身仍保留。"""
+    module = load_plugin_module()
+    data = make_data()
+    data["config"]["tasks"] = _COLLECTION_DEFS
+    data["inventory"]["fish"] = {}
+
+    def configure(plugin):
+        plugin._slot_strategy = "off"
+        plugin._max_casts_per_run = 1
+
+    plugin, result = _run_task(
+        module,
+        monkeypatch,
+        data=data,
+        responses={"perform_fishing": [catch_response()]},
+        configure=configure,
+    )
+
+    assert "任务缺口" not in result["message"], result
+    run_items = [i for i in plugin._daily["history"] if i.get("action") == "run"]
+    assert run_items, plugin._daily["history"]
+    assert all("任务缺口" not in i.get("detail", "") for i in run_items)
+    assert plugin._SiQiFishingV3__task_gap_text(), "缺口文案本身应仍有内容"
+
+
+def test_slot_continue_scheduling_guards(monkeypatch):
+    """跑满单轮上限且时段仍有余量时排 slot_continue；配额跑尽或 0 抛竿则不排。"""
+    module = load_plugin_module()
+    slot = _current_slot(module)
+
+    def plan_values(value):
+        plan = [0] * 6
+        plan[slot - 1] = value
+        return plan
+
+    # 排：本时段计划 8 竿，单轮上限 2，正常跑满 2 竿且时段仍剩余量
+    scheduler = _stub_runtime(
+        monkeypatch,
+        module,
+        data=make_data(),
+        responses={"perform_fishing": [catch_response(), catch_response()]},
+    )
+    plugin = build_plugin(module)
+    plugin._cast_interval = 0
+    plugin._schedule_mode = "slot"
+    plugin._slot_strategy = "plan"
+    plugin._slot_plan = plan_values(8)
+    plugin._max_casts_per_run = 2
+    asyncio.run(plugin.run_fishing_task())
+
+    cont = [
+        (args, kwargs)
+        for args, kwargs in scheduler.added
+        if len(args) > 1 and args[1] == "slot_continue"
+    ]
+    assert cont, scheduler.added
+    assert all(kwargs.get("delay_seconds", 0) >= 30 for _, kwargs in cont)
+    assert "run" in [i.get("action") for i in plugin._daily["history"]]
+
+    # 不排 A：本时段计划正好 2 竿（跑满即配额尽）
+    scheduler2 = _stub_runtime(
+        monkeypatch,
+        module,
+        data=make_data(),
+        responses={"perform_fishing": [catch_response(), catch_response()]},
+    )
+    plugin2 = build_plugin(module)
+    plugin2._cast_interval = 0
+    plugin2._schedule_mode = "slot"
+    plugin2._slot_strategy = "plan"
+    plugin2._slot_plan = plan_values(2)
+    plugin2._max_casts_per_run = 2
+    asyncio.run(plugin2.run_fishing_task())
+    assert not [
+        a for a, _ in scheduler2.added if len(a) > 1 and a[1] == "slot_continue"
+    ], scheduler2.added
+
+    # 不排 B：首竿即失败，casts=0
+    scheduler3 = _stub_runtime(
+        monkeypatch,
+        module,
+        data=make_data(),
+        responses={
+            "perform_fishing": [
+                FakeResponse(payload={"success": False, "message": "站点拒绝"})
+            ]
+        },
+    )
+    plugin3 = build_plugin(module)
+    plugin3._cast_interval = 0
+    plugin3._schedule_mode = "slot"
+    plugin3._slot_strategy = "plan"
+    plugin3._slot_plan = plan_values(8)
+    plugin3._max_casts_per_run = 2
+    asyncio.run(plugin3.run_fishing_task())
+    assert not [
+        a for a, _ in scheduler3.added if len(a) > 1 and a[1] == "slot_continue"
+    ], scheduler3.added
+
+
+def test_form_schedule_mode_has_slot_option(monkeypatch):
+    """配置页定时模式含「按时段计划（推荐）」置顶项与 interval 提示；详情页显示 slot 调度文案。"""
+    module = load_plugin_module()
+    monkeypatch.setattr(module, "SiteOper", StubSiteOper)
+    plugin = build_plugin(module)
+    form_text = json.dumps(plugin.get_form()[0], ensure_ascii=False)
+    assert "按时段计划（推荐）" in form_text
+    assert '"value": "slot"' in form_text
+    assert "仅固定间隔模式生效" in form_text
+
+    def _walk(node):
+        if isinstance(node, dict):
+            yield node
+            for child in node.values():
+                yield from _walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from _walk(child)
+
+    controls = [
+        item
+        for item in _walk(plugin.get_form()[0])
+        if item.get("component") == "VSelect"
+        and isinstance(item.get("props"), dict)
+        and item["props"].get("model") == "schedule_mode"
+    ]
+    assert controls, "未找到 schedule_mode 的 VSelect 控件"
+    values = [option.get("value") for option in controls[0]["props"].get("items") or []]
+    assert values[:1] == ["slot"], values
+
+    plugin._schedule_mode = "slot"
+    page_text = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "按时段计划" in page_text
 
 
 _MISSING = object()
